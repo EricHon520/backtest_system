@@ -1,18 +1,33 @@
 import sqlite3
 from typing import List
 from datetime import datetime
-from pandas.core.generic import dt
 import yfinance as yf
 from binance.client import Client
 import pytz
+import time
+import logging
 
 
 class DataLoader:
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str = "/db", price_jump_threshold: float = 0.5):
         self.db_path = db_path
         self.conn = sqlite3.connect(self.db_path)
         self.cursor = self.conn.cursor()
+        self.price_jump_threshold = price_jump_threshold
+        
+        self.last_request_time = {'stock': 0, 'crypto': 0}
+        self.rate_limit_delay = {'stock': 0.2, 'crypto': 0.1}
+        
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('data_loader.log'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
 
         # read sql file and create table
         with open('historical_data.sql', 'r') as f:
@@ -33,18 +48,27 @@ class DataLoader:
         
         for ticker in tickers:
             not_exist_timestamps = self._check_exist_data(ticker=ticker, start_time=start_ts, end_time=end_ts, frequency=frequency)
+            if not_exist_timestamps != None:
+                for not_exist_timestamp in not_exist_timestamps:
+                    check_aggregate = self._get_best_api_interval(target_interval=frequency, source=source)
 
-            for not_exist_timestamp in not_exist_timestamps:
-                start_time_dt_object_utc = datetime.utcfromtimestamp(not_exist_timestamp[0])
-                end_time_dt_object_utc = datetime.utcfromtimestamp(not_exist_timestamp[1])
-                
-                if source == "stock":
-                    data = self._get_stock_data(ticker=ticker, start_time=start_time_dt_object_utc, end_time=end_time_dt_object_utc, frequency=frequency, timezone=timezone)
-                elif source == "crypto":
-                    data = self._get_crypto_data(symbol=ticker, start_time=start_time_dt_object_utc, end_time=end_time_dt_object_utc, frequency=frequency, timezone=timezone)
-                
-                cleaned_data = self._data_preprocessing(data)
-                self._store_data(cleaned_data)
+                    start_time_dt_object_utc = datetime.utcfromtimestamp(not_exist_timestamp[0])
+                    end_time_dt_object_utc = datetime.utcfromtimestamp(not_exist_timestamp[1])
+
+                    if check_aggregate[1]:
+                        if source == "stock":
+                            data = self._get_stock_data(ticker=ticker, start_time=start_time_dt_object_utc, end_time=end_time_dt_object_utc, frequency=check_aggregate[0], timezone=timezone)
+                        elif source == "crypto":
+                            data = self._get_crypto_data(symbol=ticker, start_time=start_time_dt_object_utc, end_time=end_time_dt_object_utc, frequency=check_aggregate[0], timezone=timezone)
+                        data = self._aggregate_data(data=data, aggregate_count=check_aggregate[-1], target_interval=frequency)
+                    else:    
+                        if source == "stock":
+                            data = self._get_stock_data(ticker=ticker, start_time=start_time_dt_object_utc, end_time=end_time_dt_object_utc, frequency=frequency, timezone=timezone)
+                        elif source == "crypto":
+                            data = self._get_crypto_data(symbol=ticker, start_time=start_time_dt_object_utc, end_time=end_time_dt_object_utc, frequency=frequency, timezone=timezone)
+                    
+                    cleaned_data = self._data_preprocessing(data)
+                    self._store_data(cleaned_data)
                 
             ticker_data = self._get_from_db(ticker=ticker, start_time=start_ts, end_time=end_ts, frequency=frequency, timezone=timezone)
             historical_data.extend(ticker_data)
@@ -57,6 +81,8 @@ class DataLoader:
         return historical_data
 
     def _get_stock_data(self, ticker: str, start_time: datetime, end_time:datetime, frequency: str, timezone: str) -> List[dict]:
+        self._apply_rate_limit('stock')
+        
         ticker_obj = yf.Ticker(ticker)
         data = ticker_obj.history(start=start_time, end=end_time, interval=frequency)
 
@@ -80,6 +106,8 @@ class DataLoader:
 
 
     def _get_crypto_data(self, symbol: str, start_time: datetime, end_time: datetime, frequency: str, timezone: str) -> List[dict]:
+        self._apply_rate_limit('crypto')
+        
         client = Client()
         
         interval_mapping = {
@@ -133,8 +161,9 @@ class DataLoader:
 
     def _data_preprocessing(self, data: List[dict]) -> List[dict]:
         cleaned_data = []
-
-        for item in data:
+        
+        prev_close = None
+        for i, item in enumerate(data):
 
             if (item.get('open') is None or
                 item.get('high') is None or
@@ -154,6 +183,12 @@ class DataLoader:
             elif not (item['low'] <= item['open'] <= item['high']) or not (item['low'] <= item['close'] <= item['high']):
                 self._invalidate_data(item)
             
+            if prev_close is not None and item['open'] is not None:
+                self._check_price_jump(item, prev_close)
+            
+            if item['close'] is not None:
+                prev_close = item['close']
+            
             cleaned_data.append(item)
         
         return cleaned_data
@@ -172,7 +207,7 @@ class DataLoader:
         sql = """
         INSERT INTO historical_data
         (ticker, timestamp, frequency, open, high, low, close, volume, source, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
 
         list_tuple_data = [
@@ -270,3 +305,105 @@ class DataLoader:
             })
         
         return result
+
+    def _get_best_api_interval(self, target_interval: str, source: str) -> tuple[str, bool, int]:
+        if source == 'stock':
+            if target_interval == 'w':
+                target_interval = 'wk'
+            supported_intervals = ['1m', '2m', '5m', '15m', '30m', '60m', '90m', '1h', '1d', '5d', '1wk', '1mo', '3mo']
+        elif source == 'crypto':
+            if target_interval == 'mo':
+                target_interval = 'mo'
+            supported_intervals = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']
+
+        if target_interval in supported_intervals:
+            return (target_interval, False, 1)
+
+        target_interval_sec = self._parse_interval(target_interval)
+
+        best_api_interval = ''
+        best_api_interval_sec = 0
+
+        for supported_interval in supported_intervals:
+            supported_interval_sec = self._parse_interval(supported_interval)
+            if supported_interval_sec < target_interval_sec:
+                if target_interval_sec % supported_interval_sec == 0:
+                    best_api_interval = supported_interval
+                    best_api_interval_sec = supported_interval_sec
+        
+        aggregate_count = target_interval_sec // best_api_interval_sec
+        
+        return (best_api_interval, True, aggregate_count)
+
+    def _parse_interval(self, interval: str) -> int:
+        conversion_table = {
+            'm': 60,
+            'h': 3600,
+            'd': 86400,
+            'w': 604800,
+            'wk': 604800,
+            'mo': 2592000,
+            'M': 2592000
+        }
+        
+        if interval.endswith('wk'):
+            num = int(interval[:-2])
+            unit = 'wk'
+        elif interval.endswith('mo'):
+            num = int(interval[:-2])
+            unit = 'mo'
+        else:
+            num = int(interval[:-1])
+            unit = interval[-1]
+
+        return num * conversion_table[unit]
+
+    def _aggregate_data(self, data: List[dict], aggregate_count: int, target_interval: str) -> List[dict]:
+
+        aggregated_data = []
+        
+        for i in range(0, len(data), aggregate_count):
+            group = data[i:i + aggregate_count]
+
+            if len(group) < aggregate_count:
+                continue
+            aggregated_bar = {
+                'ticker': group[0]['ticker'],
+                'timestamp': group[0]['timestamp'],
+                'frequency': target_interval,
+                'open': group[0]['open'],
+                'high': max(bar['high'] for bar in group),
+                'low': min(bar['low'] for bar in group),
+                'close': group[-1]['close'],
+                'volume': sum(bar['volume'] for bar in group),
+                'source': group[0]['source'],
+                'timezone': group[0]['timezone'],
+                'created_at': group[0]['created_at']
+            }
+
+            aggregated_data.append(aggregated_bar)
+
+        return aggregated_data
+    
+    def _apply_rate_limit(self, source: str) -> None:
+        current_time = time.time()
+        time_since_last_request = current_time - self.last_request_time[source]
+        
+        if time_since_last_request < self.rate_limit_delay[source]:
+            sleep_time = self.rate_limit_delay[source] - time_since_last_request
+            time.sleep(sleep_time)
+        
+        self.last_request_time[source] = time.time()
+    
+    def _check_price_jump(self, current_bar: dict, prev_close: float) -> None:
+        if current_bar['open'] is None:
+            return
+        
+        price_change = abs(current_bar['open'] - prev_close) / prev_close
+        
+        if price_change > self.price_jump_threshold:
+            self.logger.warning(
+                f"Price jump detected for {current_bar['ticker']} at timestamp {current_bar['timestamp']}: "
+                f"prev_close={prev_close:.4f}, current_open={current_bar['open']:.4f}, "
+                f"change={price_change*100:.2f}%"
+            )
