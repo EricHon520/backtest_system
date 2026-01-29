@@ -1,5 +1,5 @@
 from enum import Enum
-from datetime import datetime
+from datetime import date, datetime
 
 class EventType(Enum):
     MARKET = 'MARKET'
@@ -15,8 +15,11 @@ class MarketEvent(Event):
     """
     Market event: new bar data arrived
     """
-    def __init__(self):
+    def __init__(self, datetime: datetime, symbol: str):
         super().__init__(EventType.MARKET)
+        self.datetime = datetime
+        self.symbol = symbol
+
 
 class SignalEvent(Event):
     """
@@ -45,12 +48,13 @@ class OrderEvent(Event):
         quantity: positive=buy, negative=sell
         direction: 'BUY' or 'SELL'
     """
-    def __init__(self, symbol: str, quantity: int, direction: str, order_type: str = 'MARKET'):
+    def __init__(self, symbol: str, quantity: int, direction: str, datetime: datetime, order_type: str = 'MARKET'):
         super().__init__(EventType.ORDER)
         self.symbol = symbol
         self.quantity = quantity
         self.direction = direction
         self.order_type = order_type
+        self.datetime = datetime
 
 class FillEvent(Event):
     """
@@ -64,7 +68,7 @@ class FillEvent(Event):
         fill_price: traded price
         commission: commission
     """
-    def __init__(self, symbol: str, exchange: str, quantity: int, direction: str, fill_price: float, commission: float = 0.0):
+    def __init__(self, symbol: str, exchange: str, quantity: int, direction: str, fill_price: float, datetime: datetime, rejected: bool, commission: float = 0.0):
         super().__init__(EventType.FILL)
         self.symbol = symbol
         self.exchange = exchange
@@ -72,4 +76,5 @@ class FillEvent(Event):
         self.direction = direction
         self.fill_price = fill_price
         self.commission = commission
-        
+        self.datetime = datetime
+        self.rejected = rejected

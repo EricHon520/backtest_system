@@ -6,11 +6,12 @@ from binance.client import Client
 import pytz
 import time
 import logging
+import warnings
 
 
 class DataLoader:
 
-    def __init__(self, db_path: str = "/db", price_jump_threshold: float = 0.5):
+    def __init__(self, db_path: str = "db/historical_data.db", price_jump_threshold: float = 0.5):
         self.db_path = db_path
         self.conn = sqlite3.connect(self.db_path)
         self.cursor = self.conn.cursor()
@@ -18,6 +19,9 @@ class DataLoader:
         
         self.last_request_time = {'stock': 0, 'crypto': 0}
         self.rate_limit_delay = {'stock': 0.2, 'crypto': 0.1}
+        
+        warnings.filterwarnings('ignore', category=FutureWarning, module='yfinance')
+        warnings.filterwarnings('ignore', message='.*Timestamp.utcnow.*')
         
         logging.basicConfig(
             level=logging.INFO,
@@ -28,6 +32,7 @@ class DataLoader:
             ]
         )
         self.logger = logging.getLogger(__name__)
+        logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
         # read sql file and create table
         with open('historical_data.sql', 'r') as f:
@@ -76,15 +81,23 @@ class DataLoader:
         for item in historical_data:
             utc_dt = datetime.utcfromtimestamp(item['timestamp'])
             local_dt = self._convert_timezone(utc_dt, from_tz='UTC', to_tz=timezone)
-            item['datetime_local'] = local_dt
+            item['datetime_local'] = local_dt.strftime('%Y-%m-%d %H:%M:%S %Z')
 
         return historical_data
 
     def _get_stock_data(self, ticker: str, start_time: datetime, end_time:datetime, frequency: str, timezone: str) -> List[dict]:
         self._apply_rate_limit('stock')
         
-        ticker_obj = yf.Ticker(ticker)
-        data = ticker_obj.history(start=start_time, end=end_time, interval=frequency)
+        try:
+            ticker_obj = yf.Ticker(ticker)
+            data = ticker_obj.history(start=start_time, end=end_time, interval=frequency)
+            
+            if data is None or data.empty:
+                self.logger.warning(f"No data returned from yfinance for {ticker} from {start_time} to {end_time}")
+                return []
+        except Exception as e:
+            self.logger.error(f"Error fetching data for {ticker} from {start_time} to {end_time}: {str(e)}")
+            return []
 
         result = []
         for timestamp, row in data.iterrows():
@@ -205,7 +218,7 @@ class DataLoader:
     def _store_data(self, data: List[dict]) -> None:
 
         sql = """
-        INSERT INTO historical_data
+        INSERT OR IGNORE INTO historical_data
         (ticker, timestamp, frequency, open, high, low, close, volume, source, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """

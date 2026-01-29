@@ -41,22 +41,22 @@ class DataHandler:
         return has_data
     
     def get_latest_bar(self, symbol: str) -> dict:
-        if len(self._latest_symbols_data) == 0:
+        if symbol not in self._latest_symbols_data:
             return None
-        elif len(self._latest_symbols_data[symbol]) == self._bar_index:
+        if len(self._latest_symbols_data[symbol]) == 0:
+            return None
+        if len(self._latest_symbols_data[symbol]) == self._bar_index:
             return self._latest_symbols_data[symbol][-1]
-        else:
-            return None
+        return None
 
     def get_latest_bars(self, symbol: str, num_bars: int) -> List[dict]:
-        if len(self._latest_symbols_data) == 0:
+        if symbol not in self._latest_symbols_data:
             return []
-        elif len(self._latest_symbols_data) < num_bars:
+        if len(self._latest_symbols_data[symbol]) < num_bars:
             return []
-        elif len(self._latest_symbols_data[symbol]) == self._bar_index:
+        if len(self._latest_symbols_data[symbol]) == self._bar_index:
             return self._latest_symbols_data[symbol][-num_bars:]
-        else:
-            return []
+        return []
 
 
     
