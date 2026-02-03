@@ -18,9 +18,12 @@ def main():
     frequency = '1h'
     timezone = 'Asia/Hong_Kong'
     source = 'stock'
+    # Market type: 'china_a', 'us_stock', 'hk_stock', 'crypto'
+    market_type = 'us_stock'
+    
     data_handler = DataHandler(symbols=symbols, start_time=start_time, end_time=end_time, frequency=frequency, timezone=timezone, source=source)
-    portfolio = Portfolio(data_handler=data_handler, initial_capital=10000.00)
-    execution_handler = ExecutionHandler(data_handler=data_handler, rejection_rate = 0.1, commission=0.1)
+    portfolio = Portfolio(data_handler=data_handler, initial_capital=10000.00, market_type=market_type)
+    execution_handler = ExecutionHandler(data_handler=data_handler, rejection_rate=0.1, market_type=market_type)
 
     logging.basicConfig(
             level=logging.INFO,
@@ -41,6 +44,13 @@ def main():
             latest_bar = data_handler.get_latest_bar(symbols[0])
             
             logger.info(f"Received Market event: {latest_bar}")
+            
+            # Process pending orders from previous bar FIRST
+            # This ensures orders are filled on next bar's open price
+            pending_fills = execution_handler.process_pending_orders()
+            for fill_event in pending_fills:
+                logger.info(f"Received Fill event (next bar) with price: {fill_event.fill_price}, quantity: {fill_event.quantity}")
+                event_queue.put(fill_event)
 
             event = MarketEvent(datetime=latest_bar['datetime_local'], symbol=latest_bar['ticker'])
 
@@ -65,9 +75,11 @@ def main():
                     event_queue.put(order_event)
             
             elif event.event_type == EventType.ORDER:
+                # Order is added to pending queue, will be filled on next bar
                 fill_event = execution_handler.process_order_event(event)
                 if fill_event is not None:
-                    logger.info(f"Received Fill event with price: {fill_event.fill_price}, quantity: {fill_event.quantity}")
+                    # Only if fill_on_next_bar=False
+                    logger.info(f"Received Fill event (same bar) with price: {fill_event.fill_price}, quantity: {fill_event.quantity}")
                     event_queue.put(fill_event)
 
             elif event.event_type == EventType.FILL:

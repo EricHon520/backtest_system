@@ -420,3 +420,6 @@ class DataLoader:
                 f"prev_close={prev_close:.4f}, current_open={current_bar['open']:.4f}, "
                 f"change={price_change*100:.2f}%"
             )
+
+    def _check_delisted(self):
+        pass

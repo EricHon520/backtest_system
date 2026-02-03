@@ -6,6 +6,7 @@ class EventType(Enum):
     SIGNAL = 'SIGNAL'
     ORDER = 'ORDER'
     FILL = 'FILL'
+    MARGINE = 'MARGINE'
 
 class Event:
     def __init__(self, event_type: EventType):
@@ -78,3 +79,6 @@ class FillEvent(Event):
         self.commission = commission
         self.datetime = datetime
         self.rejected = rejected
+
+class MargineCallEvent(Event):
+    pass
