@@ -1,5 +1,6 @@
 from enum import Enum
 from datetime import date, datetime
+from typing import List
 
 class EventType(Enum):
     MARKET = 'MARKET'
@@ -16,10 +17,10 @@ class MarketEvent(Event):
     """
     Market event: new bar data arrived
     """
-    def __init__(self, datetime: datetime, symbol: str):
+    def __init__(self, datetime: datetime, symbols: List[str]):
         super().__init__(EventType.MARKET)
         self.datetime = datetime
-        self.symbol = symbol
+        self.symbols = symbols
 
 
 class SignalEvent(Event):

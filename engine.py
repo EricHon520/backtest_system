@@ -1,108 +1,102 @@
-import queue
-from data_handler import DataHandler
+from queue import Queue
+from core.event import Event, EventType, MarketEvent, OrderEvent
+from data.data_handler import DataHandler
+from core.strategy import Strategy
+from portfolio.portfolio import Portfolio
+from execution.execution_handler import ExecutionHandler
+from core.instrument import InstrumentRegistry
 from datetime import datetime
-from event import EventType, MarketEvent
-from strategies.moving_average import MovingAverage
-import logging
-from execution_handler import ExecutionHandler
-from portfolio import Portfolio
-import pandas as pd
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+from typing import List
 
-def main():
-    symbols = ['GOOG']
-    start_time = datetime(2025, 1, 1)
-    end_time = datetime(2025, 2, 1)
-    frequency = '1h'
-    timezone = 'Asia/Hong_Kong'
-    source = 'stock'
-    # Market type: 'china_a', 'us_stock', 'hk_stock', 'crypto'
-    market_type = 'us_stock'
-    
-    data_handler = DataHandler(symbols=symbols, start_time=start_time, end_time=end_time, frequency=frequency, timezone=timezone, source=source)
-    portfolio = Portfolio(data_handler=data_handler, initial_capital=10000.00, market_type=market_type)
-    execution_handler = ExecutionHandler(data_handler=data_handler, rejection_rate=0.1, market_type=market_type)
+class Engine:
+    def __init__(self, data_handler: DataHandler, strategy: Strategy, portfolio: Portfolio, execution_handler:ExecutionHandler, instrument_registry: InstrumentRegistry):
+        self.data_handler = data_handler
+        self.strategy = strategy
+        self.portfolio = portfolio
+        self.queue = Queue()
+        self.execution_handler = execution_handler
+        self.instrument_registry = instrument_registry
+        self.timezone = self.data_handler._timezone
+        self.expired_symbols = set()
 
-    logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler('data_loader.log'),
-                logging.StreamHandler()
-            ]
-        )
+    def run(self):
+        while self.data_handler.update_bars():
+            updated_symbols = []
+            for symbol in self.data_handler._symbols:
+                bar = self.data_handler.get_latest_bar(symbol=symbol)
+                updated_symbols.append(bar['ticker'])
+                datetime = bar['datetime_local']
+            market_event = MarketEvent(datetime=datetime, symbols=updated_symbols)
+            self.queue.put(market_event)
 
-    logger = logging.getLogger(__name__)
+            while not self.queue.empty():
+                event = self.queue.get()
+                self._process_event(event=event)
 
-    event_queue = queue.Queue()
-    strategy = MovingAverage(data_handler=data_handler)
+    def _process_event(self, event: Event):
 
-    while True:
-        if data_handler.update_bars():
-            latest_bar = data_handler.get_latest_bar(symbols[0])
-            
-            logger.info(f"Received Market event: {latest_bar}")
-            
-            # Process pending orders from previous bar FIRST
-            # This ensures orders are filled on next bar's open price
-            pending_fills = execution_handler.process_pending_orders()
-            for fill_event in pending_fills:
-                logger.info(f"Received Fill event (next bar) with price: {fill_event.fill_price}, quantity: {fill_event.quantity}")
-                event_queue.put(fill_event)
+        match event.event_type:
+            case EventType.MARKET:
+                fill_events = self.execution_handler.process_pending_orders()
+                for fill_event in fill_events:
+                    self.queue.put(fill_event)
 
-            event = MarketEvent(datetime=latest_bar['datetime_local'], symbol=latest_bar['ticker'])
+                order_events = self._check_expirations(event.datetime)
+                if order_events is not None:
+                    for order_event in order_events:
+                        self.queue.put(order_event)
 
-            event_queue.put(event)
-        else:
-            break
-        
-        while not event_queue.empty():
-            event = event_queue.get()
+                self.portfolio.update_timeindex(market_event=event)
 
-            if event.event_type == EventType.MARKET:
-                portfolio.update_timeindex(event)
-                signal_event = strategy.calculate_signal(event=event)
-                if signal_event is not None:
-                    logger.info(f"Received Signal event at {signal_event.datetime}")
-                    event_queue.put(signal_event)
+                signal_events = self.strategy.calculate_signal(event=event)
+                if signal_events is not None:
+                    for signal_event in signal_events:
+                        self.queue.put(signal_event)
 
-            elif event.event_type == EventType.SIGNAL:
-                order_event = portfolio.process_signal_event(event)
+            case EventType.SIGNAL:
+                order_event = self.portfolio.process_signal_event(event=event)
                 if order_event is not None:
-                    logger.info(f"Received Order event with quantity: {order_event.quantity} ")
-                    event_queue.put(order_event)
-            
-            elif event.event_type == EventType.ORDER:
-                # Order is added to pending queue, will be filled on next bar
-                fill_event = execution_handler.process_order_event(event)
+                    self.queue.put(order_event)
+
+            case EventType.ORDER:
+                fill_event = self.execution_handler.process_order_event(event=event)
                 if fill_event is not None:
-                    # Only if fill_on_next_bar=False
-                    logger.info(f"Received Fill event (same bar) with price: {fill_event.fill_price}, quantity: {fill_event.quantity}")
-                    event_queue.put(fill_event)
+                    self.queue.put(fill_event)
 
-            elif event.event_type == EventType.FILL:
-                portfolio.process_fill_event(event)
+            case EventType.FILL:
+                self.portfolio.process_fill_event(event=event)
 
-            
+    def _check_expirations(self, current_time: datetime) -> List[OrderEvent]:
+        instruments = self.instrument_registry.get_all()
 
-    if len(portfolio.all_holdings) > 0:
-        df = pd.DataFrame(portfolio.all_holdings)
-        # 移除時區後綴（如 'HKT'）以避免解析錯誤
-        df['time'] = df['time'].astype(str).str.replace(r'\s+[A-Z]{3,4}$', '', regex=True)
-        df['time'] = pd.to_datetime(df['time'])
-        df = df.set_index('time')
+        order_events = []
 
-        ax = df['total'].plot(figsize=(12, 6), title='Equity Curve')
-        ax.set_xlabel('Time')
-        ax.set_ylabel('Equity')
+        timestamp = current_time.timestamp()
 
-        plt.tight_layout()
-        plt.savefig('equity_curve.png', dpi=150)
-        plt.close()
+        for instrument in instruments:
+            if instrument.is_expired(current_time=timestamp):
+                if instrument.symbol in self.expired_symbols:
+                    continue
 
-    return None
+                holding = self.portfolio.get_holding(instrument.symbol)
 
-if __name__ == '__main__':
-    main()
+                if holding is None:
+                    continue
+
+                quantity = holding['quantity']
+                if quantity != 0:
+                    direction = 'SELL' if quantity > 0 else 'BUY'
+
+                    order = OrderEvent(
+                        symbol=instrument.symbol,
+                        quantity=abs(quantity),
+                        direction=direction,
+                        datetime=current_time
+                    )
+
+                    self.expired_symbols.add(instrument.symbol)
+
+                    order_events.append(order)
+        
+        return order_events
+

@@ -8,5 +8,5 @@ class Strategy(ABC):
         self.data_handler = data_handler
 
     @abstractmethod
-    def calculate_signal(self, event: MarketEvent) -> SignalEvent:
+    def calculate_signal(self, event: MarketEvent) -> List[SignalEvent]:
         pass

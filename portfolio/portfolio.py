@@ -1,11 +1,10 @@
 from datetime import datetime, timedelta
-from typing import List, Dict
-from event import SignalEvent, OrderEvent, FillEvent, MarketEvent
-from data_handler import DataHandler
-from market_rules import MarketRules, MarketRulesFactory
+from core.event import SignalEvent, OrderEvent, FillEvent, MarketEvent
+from data.data_handler import DataHandler
+from core.instrument import InstrumentRegistry
 
 class Portfolio():
-    def __init__(self, data_handler: DataHandler, initial_capital: float, market_type: str = 'us_stock'):
+    def __init__(self, data_handler: DataHandler, initial_capital: float, instrument_registry: InstrumentRegistry):
         self.initial_capital = initial_capital
         self.current_holdings = {}
         self.current_cash = self.initial_capital
@@ -13,8 +12,9 @@ class Portfolio():
         self.all_holdings = []
         self.data_handler = data_handler
         self.total_realized_pnl = 0
-        self.market_rules = MarketRulesFactory.create_rules(market_type)
         self.pending_settlements = []  # For T+1, T+2 settlement 
+        self.instrument_registry = instrument_registry
+        self.margin_used = {}
 
     def process_signal_event(self, signal_event: SignalEvent) -> OrderEvent:
         if signal_event is None:
@@ -29,15 +29,26 @@ class Portfolio():
 
         symbol = signal_event.symbol
         signal_strength = signal_event.strength
-        
+
+        bar = self.data_handler.get_latest_bar(symbol)
+
+        instrument = self.instrument_registry.get(symbol=symbol)
+
+        market_rule = instrument.market_rule
+
         # Normalize quantity to comply with lot size
-        quantity = self.market_rules.normalize_quantity(int(signal_strength))
+        quantity = market_rule.normalize_quantity(int(signal_strength))
+
+        margin = market_rule.calculate_margin(symbol=symbol, quantity=quantity, price=bar['close'])
+
+        if margin > self.current_cash:
+            return None
         
         if quantity == 0:
             return None
         
         # For T+1 markets, check if we have enough available shares to sell
-        if direction == 'SELL' and self.market_rules.settlement_days > 0:
+        if direction == 'SELL' and market_rule.settlement_days > 0:
             if symbol in self.current_holdings:
                 available = self.current_holdings[symbol].get('available', 0)
                 if available < quantity:
@@ -59,6 +70,8 @@ class Portfolio():
             commission = fill_event.commission
             direction = fill_event.direction
             time = fill_event.datetime
+
+            market_rule = self.instrument_registry.get(symbol=symbol).market_rule
 
             if symbol not in self.current_holdings:
                 self.current_holdings[symbol] = {'quantity': 0, 'avg_cost': 0, 'available': 0}
@@ -91,21 +104,31 @@ class Portfolio():
                 if new_quantity != 0:
                     self._add_current_holding(symbol=symbol, price=fill_price, quantity=new_quantity, commission=commission)
 
+            contract_multiplier = self.instrument_registry.get(symbol).contract_multiplier
+
+            margin = market_rule.calculate_margin(symbol=symbol, quantity=quantity, price=fill_price)
+
             # Handle cash flow with commission included in fill_event
             if direction == 'BUY':
-                self.current_cash -= (fill_price * quantity + commission)
+                self.current_cash -= (margin + commission)
+                self.margin_used[symbol] = self.margin_used.get(symbol, 0) + margin
+                self.current_holdings[symbol]['last_settle_price'] = fill_price
             elif direction == 'SELL':
-                self.current_cash += (fill_price * quantity - commission)
+                if symbol in self.margin_used and current_quantity != 0:
+                    release_ratio = quantity / abs(current_quantity)
+                    released = self.margin_used[symbol] * release_ratio
+                    self.margin_used[symbol] -= released
+                    self.current_cash += (released - commission)
             
             # Handle T+1, T+2 settlement for availability
-            if self.market_rules.settlement_days > 0:
+            if market_rule.settlement_days > 0:
                 if direction == 'BUY':
                     # Add to pending settlements, will be available after settlement_days
                     self.pending_settlements.append({
                         'symbol': symbol,
                         'quantity': quantity,
                         'buy_time': time,
-                        'settlement_days': self.market_rules.settlement_days
+                        'settlement_days': market_rule.settlement_days
                     })
                 elif direction == 'SELL':
                     # Reduce available quantity when selling
@@ -143,18 +166,39 @@ class Portfolio():
                 latest_bar = self.data_handler.get_latest_bar(symbol)
                 
                 if latest_bar:
+
+                    market_rule = self.instrument_registry.get(symbol=symbol).market_rule
                     current_price = latest_bar['close']
                     quantity = position['quantity']
                     avg_cost = position['avg_cost']
 
-                    market_value = quantity * current_price
-                    unrealized_pnl = (current_price - avg_cost) * quantity
+                    contract_multiplier = self.instrument_registry.get(symbol=symbol).contract_multiplier
+
+                    # mark to market
+                    if market_rule.requires_daily_settlement:
+                        prev_price = position.get('last_settle_price', avg_cost)
+                        mtm_pnl = (current_price - prev_price) * quantity * contract_multiplier
+                        self.current_cash += mtm_pnl
+                        holdings['cash'] += mtm_pnl
+                        holdings['total'] += mtm_pnl
+                        position['last_settle_price'] = current_price
+
+                    market_value = quantity * current_price * contract_multiplier
+                    if market_rule.requires_daily_settlement:
+                        unrealized_pnl = (current_price - position['last_settle_price']) * quantity * contract_multiplier
+                    else:
+                        unrealized_pnl = (current_price - avg_cost) * quantity * contract_multiplier
 
                     holdings[symbol + '_value'] = market_value
                     holdings[symbol + '_pnl'] = unrealized_pnl
                     holdings['total'] += market_value
         
         self.all_holdings.append(holdings)
+
+
+    def get_holding(self, symbol: str) -> dict:
+        if symbol in self.current_holdings:
+            return self.current_holdings[symbol]
 
     def _add_current_holding(self, symbol: str, price: float, quantity: float, commission: float) -> None:
         current_quantity = self.current_holdings[symbol]['quantity']
@@ -181,15 +225,17 @@ class Portfolio():
 
     def _calculate_pnl(self, symbol: str, price: float, quantity: float, commission: float) -> float:
         current_avg_cost = self.current_holdings[symbol]['avg_cost']
+
+        contract_multiplier = self.instrument_registry.get(symbol).contract_multiplier
         
         # Commission is already calculated in fill_event, so we just need price difference
         commission_per_share = commission / abs(quantity) if quantity != 0 else 0
 
         if quantity < 0:
-            pnl = abs(quantity) * ((price - commission_per_share) - current_avg_cost)
+            pnl = abs(quantity) * ((price - commission_per_share) - current_avg_cost) * contract_multiplier
 
         elif quantity > 0:
-            pnl = quantity * (current_avg_cost - (price + commission_per_share))
+            pnl = quantity * (current_avg_cost - (price + commission_per_share)) * contract_multiplier
 
         return pnl
     

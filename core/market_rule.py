@@ -4,7 +4,7 @@ from typing import Optional, Dict, Any
 import pytz
 import math
 
-class MarketRules(ABC):
+class MarketRule(ABC):
     """
     Abstract base class for market-specific trading rules
     """
@@ -20,6 +20,9 @@ class MarketRules(ABC):
         self.price_tick = 0.01
         self.allow_short = True
         self.settlement_days = 0  # T+0, T+1, T+2, etc.
+
+        # Mark to market
+        self.requires_daily_settlement = False
         
         # Slippage model parameters
         self.slippage_model = "volume_based"  # "fixed", "volume_based", "spread_based"
@@ -136,8 +139,11 @@ class MarketRules(ABC):
         
         return price
 
+    def calculate_margin(self, symbol: str, quantity: int, price: float):
+        return quantity * price
 
-class ChinaAShareRules(MarketRules):
+
+class ChinaAShareRules(MarketRule):
     """
     A-Share market rules (Shanghai/Shenzhen Stock Exchange)
     """
@@ -244,7 +250,7 @@ class ChinaAShareRules(MarketRules):
         return total_fee
 
 
-class USStockRules(MarketRules):
+class USStockRules(MarketRule):
     """
     US Stock market rules (NYSE/NASDAQ)
     """
@@ -311,7 +317,7 @@ class USStockRules(MarketRules):
         return commission
 
 
-class HKStockRules(MarketRules):
+class HKStockRules(MarketRule):
     """
     Hong Kong Stock Exchange rules
     """
@@ -401,7 +407,7 @@ class HKStockRules(MarketRules):
         return total_fee
 
 
-class CryptoRules(MarketRules):
+class CryptoRules(MarketRule):
     """
     Cryptocurrency market rules
     """

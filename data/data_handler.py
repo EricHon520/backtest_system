@@ -11,6 +11,7 @@ class DataHandler:
         self._timezone = timezone
         self._source = source
         self._bar_index = 0
+        self.symbol_bar_map = {}
 
         self._data_loader = DataLoader()
 
@@ -24,14 +25,31 @@ class DataHandler:
         for symbol in symbols:
             self._symbols_data[symbol].sort(key=lambda x: x["timestamp"])
 
+        for symbol in symbols:
+            self.symbol_bar_map[symbol] = {}
+            for bar in self._symbols_data[symbol]:
+                timestamp = bar['timestamp']
+                self.symbol_bar_map[symbol][timestamp] = bar
+        
+        all_timestamps = set()
+        for symbol in symbols:
+            all_timestamps.update(self.symbol_bar_map[symbol].keys())
+        self.timeline = sorted(all_timestamps)
+        
+
         self._latest_symbols_data = {symbol: [] for symbol in symbols}
 
     def update_bars(self) -> bool:
         has_data = False
 
+        if self._bar_index >= len(self.timeline):
+            return False
+
+        timestamp = self.timeline[self._bar_index]
+
         for symbol in self._symbols:
-            if len(self._symbols_data[symbol]) > self._bar_index:
-                bar = self._symbols_data[symbol][self._bar_index]
+            if timestamp in self.symbol_bar_map[symbol]:
+                bar = self.symbol_bar_map[symbol][timestamp]
                 self._latest_symbols_data[symbol].append(bar)
                 has_data = True
 
@@ -45,7 +63,10 @@ class DataHandler:
             return None
         if len(self._latest_symbols_data[symbol]) == 0:
             return None
-        if len(self._latest_symbols_data[symbol]) == self._bar_index:
+
+        timestamp = self.timeline[self._bar_index - 1]
+
+        if timestamp in self.symbol_bar_map[symbol]:
             return self._latest_symbols_data[symbol][-1]
         return None
 
@@ -54,7 +75,10 @@ class DataHandler:
             return []
         if len(self._latest_symbols_data[symbol]) < num_bars:
             return []
-        if len(self._latest_symbols_data[symbol]) == self._bar_index:
+
+        timestamp = self.timeline[self._bar_index - 1]
+
+        if timestamp in self.symbol_bar_map[symbol]:
             return self._latest_symbols_data[symbol][-num_bars:]
         return []
 
