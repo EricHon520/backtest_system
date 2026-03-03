@@ -1,14 +1,17 @@
-from data_loader import DataLoader
+from data.data_loader import DataLoader
 from typing import List
 from datetime import datetime
 
-class DataHandler:
+from core.types import BarData
+from core.data_feed import DataFeed
+
+class DataHandler(DataFeed):
     def __init__(self, symbols: List[str], start_time: datetime, end_time: datetime, frequency: str, timezone: str, source: str):
         self._symbols = symbols
+        self._timezone = timezone
         self._start_time = start_time
         self._end_time = end_time
         self._frequency = frequency
-        self._timezone = timezone
         self._source = source
         self._bar_index = 0
         self.symbol_bar_map = {}
@@ -39,6 +42,10 @@ class DataHandler:
 
         self._latest_symbols_data = {symbol: [] for symbol in symbols}
 
+    @property
+    def symbols(self) -> List[str]:
+        return list(self._symbols)
+
     def update_bars(self) -> bool:
         has_data = False
 
@@ -58,7 +65,7 @@ class DataHandler:
         
         return has_data
     
-    def get_latest_bar(self, symbol: str) -> dict:
+    def get_latest_bar(self, symbol: str) -> BarData | None:
         if symbol not in self._latest_symbols_data:
             return None
         if len(self._latest_symbols_data[symbol]) == 0:
@@ -70,7 +77,7 @@ class DataHandler:
             return self._latest_symbols_data[symbol][-1]
         return None
 
-    def get_latest_bars(self, symbol: str, num_bars: int) -> List[dict]:
+    def get_latest_bars(self, symbol: str, num_bars: int) -> List[BarData]:
         if symbol not in self._latest_symbols_data:
             return []
         if len(self._latest_symbols_data[symbol]) < num_bars:

@@ -1,4 +1,6 @@
+import os
 import sqlite3
+import json
 from typing import List
 from datetime import datetime
 import yfinance as yf
@@ -9,38 +11,50 @@ import logging
 import warnings
 
 
+from core.types import BarData
+
 class DataLoader:
 
-    def __init__(self, db_path: str = "db/historical_data.db", price_jump_threshold: float = 0.5):
+    _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def __init__(self, db_path: str = None, price_jump_threshold: float = 0.5):
+        if db_path is None:
+            db_path = os.path.join(self._BASE_DIR, 'db', 'historical_data.db')
         self.db_path = db_path
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self.conn = sqlite3.connect(self.db_path)
         self.cursor = self.conn.cursor()
         self.price_jump_threshold = price_jump_threshold
-        
+
         self.last_request_time = {'stock': 0, 'crypto': 0}
         self.rate_limit_delay = {'stock': 0.2, 'crypto': 0.1}
-        
+
         warnings.filterwarnings('ignore', category=FutureWarning, module='yfinance')
         warnings.filterwarnings('ignore', message='.*Timestamp.utcnow.*')
-        
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler('data_loader.log'),
-                logging.StreamHandler()
-            ]
-        )
+
         self.logger = logging.getLogger(__name__)
         logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
         # read sql file and create table
-        with open('historical_data.sql', 'r') as f:
+        sql_path = os.path.join(self._BASE_DIR, 'historical_data.sql')
+        with open(sql_path, 'r') as f:
             sql = f.read()
         self.cursor.execute(sql)
         self.conn.commit()
 
-    def get_historical_data(self, tickers: List[str], start_time: datetime, end_time: datetime, frequency: str, timezone: str, source: str) -> List[dict]:
+        self._ranges_path = os.path.join(self._BASE_DIR, 'db', 'fetched_ranges.json')
+        self._fetched_ranges = self._load_fetched_ranges()
+
+        self._binance_client = Client()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.conn.close()
+        return False
+
+    def get_historical_data(self, tickers: List[str], start_time: datetime, end_time: datetime, frequency: str, timezone: str, source: str) -> List[BarData]:
         self._check_edge_case(start_time=start_time, end_time=end_time)
 
         start_time_utc = self._convert_timezone(dt=start_time, from_tz=timezone, to_tz='UTC')
@@ -53,7 +67,7 @@ class DataLoader:
         
         for ticker in tickers:
             not_exist_timestamps = self._check_exist_data(ticker=ticker, start_time=start_ts, end_time=end_ts, frequency=frequency)
-            if not_exist_timestamps != None:
+            if not_exist_timestamps:
                 for not_exist_timestamp in not_exist_timestamps:
                     check_aggregate = self._get_best_api_interval(target_interval=frequency, source=source)
 
@@ -74,6 +88,7 @@ class DataLoader:
                     
                     cleaned_data = self._data_preprocessing(data)
                     self._store_data(cleaned_data)
+                    self._update_fetched_ranges(ticker, frequency, not_exist_timestamp[0], not_exist_timestamp[1])
                 
             ticker_data = self._get_from_db(ticker=ticker, start_time=start_ts, end_time=end_ts, frequency=frequency, timezone=timezone)
             historical_data.extend(ticker_data)
@@ -85,7 +100,7 @@ class DataLoader:
 
         return historical_data
 
-    def _get_stock_data(self, ticker: str, start_time: datetime, end_time:datetime, frequency: str, timezone: str) -> List[dict]:
+    def _get_stock_data(self, ticker: str, start_time: datetime, end_time:datetime, frequency: str, timezone: str) -> List[BarData]:
         self._apply_rate_limit('stock')
         
         try:
@@ -118,10 +133,8 @@ class DataLoader:
         return result
 
 
-    def _get_crypto_data(self, symbol: str, start_time: datetime, end_time: datetime, frequency: str, timezone: str) -> List[dict]:
+    def _get_crypto_data(self, symbol: str, start_time: datetime, end_time: datetime, frequency: str, timezone: str) -> List[BarData]:
         self._apply_rate_limit('crypto')
-        
-        client = Client()
         
         interval_mapping = {
             '1m': Client.KLINE_INTERVAL_1MINUTE,
@@ -146,7 +159,7 @@ class DataLoader:
         if not interval:
             raise ValueError(f"Unsupported frequency: {frequency}")
 
-        klines = client.get_historical_klines(
+        klines = self._binance_client.get_historical_klines(
             symbol=symbol, 
             interval=interval,
             start_str=start_time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -172,7 +185,7 @@ class DataLoader:
 
         return result
 
-    def _data_preprocessing(self, data: List[dict]) -> List[dict]:
+    def _data_preprocessing(self, data: List[BarData]) -> List[BarData]:
         cleaned_data = []
         
         prev_close = None
@@ -188,13 +201,21 @@ class DataLoader:
                 continue
 
             if item['open'] <= 0 or item['high'] <= 0 or item['low'] <= 0 or item['close'] <= 0:
-                self._invalidate_data(item)            
+                self._invalidate_data(item)
+                cleaned_data.append(item)
+                continue
             elif item['volume'] < 0:
-                self._invalidate_data(item)    
+                self._invalidate_data(item)
+                cleaned_data.append(item)
+                continue
             elif item['high'] < item['low']:
                 self._invalidate_data(item)
+                cleaned_data.append(item)
+                continue
             elif not (item['low'] <= item['open'] <= item['high']) or not (item['low'] <= item['close'] <= item['high']):
                 self._invalidate_data(item)
+                cleaned_data.append(item)
+                continue
             
             if prev_close is not None and item['open'] is not None:
                 self._check_price_jump(item, prev_close)
@@ -215,7 +236,7 @@ class DataLoader:
 
         return dt.astimezone(to_timezone)
 
-    def _store_data(self, data: List[dict]) -> None:
+    def _store_data(self, data: List[BarData]) -> None:
 
         sql = """
         INSERT OR IGNORE INTO historical_data
@@ -233,64 +254,73 @@ class DataLoader:
         self.conn.commit()
 
     def _check_exist_data(self, ticker: str, start_time: int, end_time: int, frequency: str) -> List[tuple]:
+        key = f"{ticker}__{frequency}"
+        fetched = self._fetched_ranges.get(key, [])
 
-        sql = """
-        SELECT timestamp FROM historical_data
-        WHERE ticker = ?
-        AND frequency = ?
-        AND timestamp >= ?
-        AND timestamp <= ?
-        ORDER BY timestamp
-        """
+        # Use one bar period as the adjacency threshold so that two fetched
+        # ranges separated by exactly one bar period are treated as contiguous,
+        # rather than the naive ±1 second which is meaningless for daily bars.
+        bar_period = self._parse_interval(frequency)
 
-        self.cursor.execute(sql, (ticker, frequency, start_time, end_time))
-        existing_timestamps = self.cursor.fetchall()
+        uncovered = [(start_time, end_time)]
+        for f_start, f_end in fetched:
+            next_uncovered = []
+            for u_start, u_end in uncovered:
+                if f_end < u_start or f_start > u_end:
+                    next_uncovered.append((u_start, u_end))
+                else:
+                    if u_start < f_start:
+                        next_uncovered.append((u_start, f_start - bar_period))
+                    if u_end > f_end:
+                        next_uncovered.append((f_end + bar_period, u_end))
+            uncovered = [(s, e) for s, e in next_uncovered if s <= e]
 
-        existing_timestamps_list = [existing_timestamp[0] for existing_timestamp in existing_timestamps]
+        return uncovered
 
-        if not existing_timestamps:
-            return [(start_time, end_time)]
+    def _load_fetched_ranges(self) -> dict:
+        if os.path.exists(self._ranges_path):
+            with open(self._ranges_path, 'r') as f:
+                return json.load(f)
+        return {}
 
-        # convert frequecy from string to integer
-        unit = frequency[-1]
-        interval_str = frequency[0:len(frequency) - 1]
-        interval_int = int(interval_str)
-        if unit == 'm':
-            frequency_seconds = interval_int * 60
-        elif unit == 'h':
-            frequency_seconds = interval_int * 3600
-        else:
-            frequency_seconds = interval_int * 86400
+    def _save_fetched_ranges(self) -> None:
+        with open(self._ranges_path, 'w') as f:
+            json.dump(self._fetched_ranges, f)
 
-        not_exist_timestamps = []
+    def _update_fetched_ranges(self, ticker: str, frequency: str, start_time: int, end_time: int) -> None:
+        key = f"{ticker}__{frequency}"
+        ranges = self._fetched_ranges.get(key, [])
+        ranges.append([start_time, end_time])
+        ranges.sort(key=lambda x: x[0])
 
-        if existing_timestamps_list[0] > start_time:
-            not_exist_timestamps.append((start_time, existing_timestamps_list[0] - frequency_seconds))
+        # Use the same bar_period adjacency threshold as _check_exist_data so
+        # that two ranges separated by exactly one bar period are merged here
+        # and not treated as a gap requiring a re-fetch.
+        bar_period = self._parse_interval(frequency)
 
-        if existing_timestamps_list[-1] < end_time:
-            not_exist_timestamps.append((existing_timestamps_list[-1] + frequency_seconds, end_time))
+        merged = [ranges[0]]
+        for current in ranges[1:]:
+            last = merged[-1]
+            if current[0] <= last[1] + bar_period:
+                last[1] = max(last[1], current[1])
+            else:
+                merged.append(current)
 
-        for i in range(len(existing_timestamps_list ) - 1):
-            gap = existing_timestamps_list[i + 1] - existing_timestamps_list[i]
-            if gap > frequency_seconds:
-                not_exist_start_time = existing_timestamps_list[i] + frequency_seconds
-                not_exist_end_time = existing_timestamps_list[i + 1] - frequency_seconds
-                not_exist_timestamps.append((not_exist_start_time, not_exist_end_time))
-
-        return not_exist_timestamps
+        self._fetched_ranges[key] = merged
+        self._save_fetched_ranges()
 
     def _check_edge_case(self, start_time: datetime, end_time: datetime) -> None:
         if start_time > end_time:
             raise ValueError(f"Invalid time range: start time ({start_time}) > end time ({end_time})")
 
-    def _invalidate_data(self, item: dict) -> None:
+    def _invalidate_data(self, item: BarData) -> None:
         item['open'] = None
         item['high'] = None
         item['low'] = None
         item['close'] = None
         item['volume'] = None
 
-    def _get_from_db(self, ticker: str, start_time: int, end_time: int, frequency: str, timezone: str) -> List[dict]:
+    def _get_from_db(self, ticker: str, start_time: int, end_time: int, frequency: str, timezone: str) -> List[BarData]:
         sql = """
         SELECT ticker, timestamp, frequency, open, high, low, close, volume, source FROM historical_data
         WHERE ticker = ?
@@ -325,8 +355,6 @@ class DataLoader:
                 target_interval = 'wk'
             supported_intervals = ['1m', '2m', '5m', '15m', '30m', '60m', '90m', '1h', '1d', '5d', '1wk', '1mo', '3mo']
         elif source == 'crypto':
-            if target_interval == 'mo':
-                target_interval = 'mo'
             supported_intervals = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']
 
         if target_interval in supported_intervals:
@@ -341,11 +369,19 @@ class DataLoader:
             supported_interval_sec = self._parse_interval(supported_interval)
             if supported_interval_sec < target_interval_sec:
                 if target_interval_sec % supported_interval_sec == 0:
-                    best_api_interval = supported_interval
-                    best_api_interval_sec = supported_interval_sec
-        
+                    # Keep the largest divisible interval to minimise API calls
+                    if supported_interval_sec > best_api_interval_sec:
+                        best_api_interval = supported_interval
+                        best_api_interval_sec = supported_interval_sec
+
+        if best_api_interval_sec == 0:
+            raise ValueError(
+                f"No supported API interval can aggregate into '{target_interval}' "
+                f"for source '{source}'. Supported: {supported_intervals}"
+            )
+
         aggregate_count = target_interval_sec // best_api_interval_sec
-        
+
         return (best_api_interval, True, aggregate_count)
 
     def _parse_interval(self, interval: str) -> int:
@@ -371,7 +407,7 @@ class DataLoader:
 
         return num * conversion_table[unit]
 
-    def _aggregate_data(self, data: List[dict], aggregate_count: int, target_interval: str) -> List[dict]:
+    def _aggregate_data(self, data: List[BarData], aggregate_count: int, target_interval: str) -> List[BarData]:
 
         aggregated_data = []
         
@@ -380,15 +416,23 @@ class DataLoader:
 
             if len(group) < aggregate_count:
                 continue
+
+            valid_bars = [bar for bar in group if bar['high'] is not None and bar['low'] is not None and bar['volume'] is not None]
+            if not valid_bars:
+                continue
+
+            open_price = next((bar['open'] for bar in group if bar['open'] is not None), None)
+            close_price = next((bar['close'] for bar in reversed(group) if bar['close'] is not None), None)
+
             aggregated_bar = {
                 'ticker': group[0]['ticker'],
                 'timestamp': group[0]['timestamp'],
                 'frequency': target_interval,
-                'open': group[0]['open'],
-                'high': max(bar['high'] for bar in group),
-                'low': min(bar['low'] for bar in group),
-                'close': group[-1]['close'],
-                'volume': sum(bar['volume'] for bar in group),
+                'open': open_price,
+                'high': max(bar['high'] for bar in valid_bars),
+                'low': min(bar['low'] for bar in valid_bars),
+                'close': close_price,
+                'volume': sum(bar['volume'] for bar in valid_bars),
                 'source': group[0]['source'],
                 'timezone': group[0]['timezone'],
                 'created_at': group[0]['created_at']
@@ -408,7 +452,7 @@ class DataLoader:
         
         self.last_request_time[source] = time.time()
     
-    def _check_price_jump(self, current_bar: dict, prev_close: float) -> None:
+    def _check_price_jump(self, current_bar: BarData, prev_close: float) -> None:
         if current_bar['open'] is None:
             return
         

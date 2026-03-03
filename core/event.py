@@ -1,13 +1,13 @@
 from enum import Enum
 from datetime import date, datetime
-from typing import List
+from typing import List, Optional
 
 class EventType(Enum):
     MARKET = 'MARKET'
     SIGNAL = 'SIGNAL'
     ORDER = 'ORDER'
     FILL = 'FILL'
-    MARGINE = 'MARGINE'
+    MARGIN_CALL = 'MARGIN_CALL'
 
 class Event:
     def __init__(self, event_type: EventType):
@@ -32,13 +32,24 @@ class SignalEvent(Event):
         datetime: time of signal generated
         signal_type: 'LONG', 'SHORT' OR 'EXIT'
         strength: signal strength (optional, use for managing position)
+        confidence: signal confidence in [0.0, 1.0], used by PositionSizer to scale position
+        expiry: optional datetime after which the signal is considered stale
     """
-    def __init__(self, symbol: str, datetime: datetime, signal_type: str, strength: float = 1.0):
+    def __init__(self, symbol: str, datetime: datetime, signal_type: str,
+                 strength: float = 1.0, confidence: float = 1.0,
+                 expiry: Optional[datetime] = None):
         super().__init__(EventType.SIGNAL)
         self.symbol = symbol
         self.datetime = datetime
         self.signal_type = signal_type
         self.strength = strength
+        self.confidence = confidence
+        self.expiry = expiry
+
+    def is_expired(self, current_time: datetime) -> bool:
+        if self.expiry is None:
+            return False
+        return current_time > self.expiry
 
 class OrderEvent(Event):
     """
@@ -50,13 +61,14 @@ class OrderEvent(Event):
         quantity: positive=buy, negative=sell
         direction: 'BUY' or 'SELL'
     """
-    def __init__(self, symbol: str, quantity: int, direction: str, datetime: datetime, order_type: str = 'MARKET'):
+    def __init__(self, symbol: str, quantity: int, direction: str, datetime: datetime, limit_price: Optional[float] = None, order_type: str = 'MARKET'):
         super().__init__(EventType.ORDER)
         self.symbol = symbol
         self.quantity = quantity
         self.direction = direction
         self.order_type = order_type
         self.datetime = datetime
+        self.limit_price = limit_price
 
 class FillEvent(Event):
     """
@@ -81,5 +93,5 @@ class FillEvent(Event):
         self.datetime = datetime
         self.rejected = rejected
 
-class MargineCallEvent(Event):
+class MarginCallEvent(Event):
     pass

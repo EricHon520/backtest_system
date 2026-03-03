@@ -1,22 +1,40 @@
+import warnings
 from datetime import datetime, timedelta
+from typing import Dict, Optional
 from core.event import SignalEvent, OrderEvent, FillEvent, MarketEvent
-from data.data_handler import DataHandler
 from core.instrument import InstrumentRegistry
 
 class Portfolio():
-    def __init__(self, data_handler: DataHandler, initial_capital: float, instrument_registry: InstrumentRegistry):
+    def __init__(self, initial_capital: float, instrument_registry: InstrumentRegistry,
+                 data_handler=None):
         self.initial_capital = initial_capital
         self.current_holdings = {}
         self.current_cash = self.initial_capital
         self.positions = []
         self.all_holdings = []
-        self.data_handler = data_handler
         self.total_realized_pnl = 0
-        self.pending_settlements = []  # For T+1, T+2 settlement 
+        self.pending_settlements = []  # For T+1, T+2 settlement
         self.instrument_registry = instrument_registry
         self.margin_used = {}
+        if data_handler is not None:
+            warnings.warn(
+                "Portfolio no longer requires data_handler. "
+                "Pass current_prices to update_timeindex() instead. "
+                "The data_handler argument will be removed in a future version.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self._legacy_data_handler = data_handler
+        else:
+            self._legacy_data_handler = None
 
-    def process_signal_event(self, signal_event: SignalEvent) -> OrderEvent:
+    def process_signal_event(self, signal_event: SignalEvent) -> OrderEvent:  # noqa: E501
+        warnings.warn(
+            "Portfolio.process_signal_event() is deprecated. "
+            "Use Engine's PositionSizer + RiskManager pipeline instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         if signal_event is None:
             return None
 
@@ -30,7 +48,7 @@ class Portfolio():
         symbol = signal_event.symbol
         signal_strength = signal_event.strength
 
-        bar = self.data_handler.get_latest_bar(symbol)
+        bar = self._legacy_data_handler.get_latest_bar(symbol)
 
         instrument = self.instrument_registry.get(symbol=symbol)
 
@@ -39,20 +57,24 @@ class Portfolio():
         # Normalize quantity to comply with lot size
         quantity = market_rule.normalize_quantity(int(signal_strength))
 
-        margin = market_rule.calculate_margin(symbol=symbol, quantity=quantity, price=bar['close'])
+        margin = market_rule.calculate_margin(symbol=symbol, quantity=quantity, price=bar['close'], contract_multiplier=instrument.contract_multiplier)
 
         if margin > self.current_cash:
             return None
         
         if quantity == 0:
             return None
-        
-        # For T+1 markets, check if we have enough available shares to sell
-        if direction == 'SELL' and market_rule.settlement_days > 0:
-            if symbol in self.current_holdings:
-                available = self.current_holdings[symbol].get('available', 0)
+
+        if direction == 'SELL':
+            current_quantity = self.current_holdings.get(symbol, {}).get('quantity', 0)
+
+            if current_quantity <= 0 and not market_rule.allow_short:
+                return None
+            
+            # For T+1 markets, check if there are enough available shares to sell
+            if market_rule.settlement_days > 0 and current_quantity > 0:
+                available = self.current_holdings.get(symbol, {}).get('available', 0)
                 if available < quantity:
-                    # Not enough available shares (T+1 restriction)
                     return None
 
         return OrderEvent(
@@ -95,30 +117,86 @@ class Portfolio():
             # 減倉        
             elif current_quantity * quantity_change < 0 and abs(current_quantity) > abs(quantity_change):
                 self._reduce_current_holding(symbol=symbol, price=fill_price, quantity=quantity, commission=commission)
-                pnl = self._calculate_pnl(symbol=symbol, price=fill_price, quantity=quantity, commission=commission)
+                pnl = self._calculate_pnl(symbol=symbol, price=fill_price, quantity=quantity, direction=direction, commission=commission)
 
             # 平倉或轉向
             elif current_quantity * quantity_change < 0 and abs(current_quantity) <= abs(quantity_change):
-                self._reduce_current_holding(symbol=symbol, price=fill_price, quantity=abs(current_quantity), commission=commission)
-                pnl = self._calculate_pnl(symbol=symbol, price=fill_price, quantity=quantity, commission=commission)
+                close_qty = abs(current_quantity)
+                self._reduce_current_holding(symbol=symbol, price=fill_price, quantity=close_qty, commission=commission)
+                pnl = self._calculate_pnl(symbol=symbol, price=fill_price, quantity=close_qty, direction=direction, commission=commission)
                 if new_quantity != 0:
                     self._add_current_holding(symbol=symbol, price=fill_price, quantity=new_quantity, commission=commission)
 
             contract_multiplier = self.instrument_registry.get(symbol).contract_multiplier
 
-            margin = market_rule.calculate_margin(symbol=symbol, quantity=quantity, price=fill_price)
+            margin = market_rule.calculate_margin(symbol=symbol, quantity=quantity, price=fill_price, contract_multiplier=contract_multiplier)
 
-            # Handle cash flow with commission included in fill_event
+            # ----------------------------------------------------------------
+            # Cash-flow accounting
+            # Rules:
+            #   BUY  (open long / close short)  : deduct margin + commission
+            #   SELL (open short / close long)   : depends on instrument type
+            #
+            # For a reversal (close old + open new in same fill), we handle the
+            # closing leg first, then deduct/add for the new leg separately.
+            # ----------------------------------------------------------------
+            is_reversal = (current_quantity * quantity_change < 0
+                           and abs(current_quantity) < abs(quantity_change))
+            new_leg_qty = abs(new_quantity) if is_reversal else 0
+            close_leg_qty = abs(current_quantity) if is_reversal else quantity
+
             if direction == 'BUY':
-                self.current_cash -= (margin + commission)
-                self.margin_used[symbol] = self.margin_used.get(symbol, 0) + margin
+                if is_reversal:
+                    # Closing leg: short was open — return short margin + pnl.
+                    # position_qty = abs(current_quantity) so exactly 100% of
+                    # the short margin is released.
+                    self._close_short_cash(symbol, market_rule, close_leg_qty,
+                                           abs(current_quantity), fill_price,
+                                           contract_multiplier, pnl, commission)
+                    # New leg: open long — deduct margin
+                    new_margin = market_rule.calculate_margin(
+                        symbol=symbol, quantity=new_leg_qty,
+                        price=fill_price, contract_multiplier=contract_multiplier)
+                    self.current_cash -= new_margin  # commission already paid once
+                    self.margin_used[symbol] = self.margin_used.get(symbol, 0) + new_margin
+                else:
+                    self.current_cash -= (margin + commission)
+                    self.margin_used[symbol] = self.margin_used.get(symbol, 0) + margin
                 self.current_holdings[symbol]['last_settle_price'] = fill_price
+
             elif direction == 'SELL':
-                if symbol in self.margin_used and current_quantity != 0:
-                    release_ratio = quantity / abs(current_quantity)
-                    released = self.margin_used[symbol] * release_ratio
-                    self.margin_used[symbol] -= released
-                    self.current_cash += (released - commission)
+                if is_reversal:
+                    # Closing leg: long was open — return proceeds / margin.
+                    # position_qty = abs(current_quantity) so exactly 100% of
+                    # the long margin is released.
+                    self._close_long_cash(symbol, market_rule, close_leg_qty,
+                                          abs(current_quantity), fill_price,
+                                          contract_multiplier, pnl, commission)
+                    # New leg: open short — deduct margin
+                    new_margin = market_rule.calculate_margin(
+                        symbol=symbol, quantity=new_leg_qty,
+                        price=fill_price, contract_multiplier=contract_multiplier)
+                    self.current_cash -= new_margin  # commission already paid once
+                    self.margin_used[symbol] = self.margin_used.get(symbol, 0) + new_margin
+                    self.current_holdings[symbol]['last_settle_price'] = fill_price
+                elif market_rule.requires_daily_settlement:
+                    if current_quantity > 0:
+                        # Partial or full close of a long futures position.
+                        # position_qty = current_quantity so only the proportional
+                        # share of margin is released (e.g. selling 1 of 3 lots
+                        # releases 1/3 of margin_used).
+                        self._close_long_cash(symbol, market_rule, quantity,
+                                              current_quantity, fill_price,
+                                              contract_multiplier, pnl, commission)
+                    else:
+                        # Opening a SHORT futures position
+                        self.current_cash -= (margin + commission)
+                        self.margin_used[symbol] = self.margin_used.get(symbol, 0) + margin
+                        self.current_holdings[symbol]['last_settle_price'] = fill_price
+                else:
+                    # Stocks: cash received = sale proceeds − commission
+                    self.current_cash += quantity * fill_price * contract_multiplier - commission
+                    self.margin_used.pop(symbol, None)
             
             # Handle T+1, T+2 settlement for availability
             if market_rule.settlement_days > 0:
@@ -131,8 +209,10 @@ class Portfolio():
                         'settlement_days': market_rule.settlement_days
                     })
                 elif direction == 'SELL':
-                    # Reduce available quantity when selling
-                    self.current_holdings[symbol]['available'] -= quantity
+                    # Reduce available quantity when selling (floor at 0)
+                    self.current_holdings[symbol]['available'] = max(
+                        0, self.current_holdings[symbol].get('available', 0) - quantity
+                    )
             else:
                 # T+0 market, immediately available
                 self.current_holdings[symbol]['available'] = self.current_holdings[symbol]['quantity']
@@ -150,49 +230,74 @@ class Portfolio():
             }
             self.positions.append(position)
 
-    def update_timeindex(self, market_event: MarketEvent):
+    def update_timeindex(self, market_event: MarketEvent,
+                         current_prices: Optional[Dict[str, float]] = None):
+        """
+        Take a mark-to-market snapshot of the portfolio.
+
+        Args:
+            market_event:   The current MarketEvent (provides timestamp).
+            current_prices: Dict mapping symbol → latest close price.
+                            If omitted and a legacy data_handler was supplied,
+                            prices are fetched from it (deprecated path).
+        """
         # Process pending settlements (T+1, T+2)
         self._process_settlements(market_event.datetime)
-        
+
+        # Build price dict via legacy data_handler if caller didn't supply prices
+        if current_prices is None:
+            if self._legacy_data_handler is not None:
+                current_prices = {}
+                for sym in self.current_holdings:
+                    bar = self._legacy_data_handler.get_latest_bar(sym)
+                    if bar:
+                        current_prices[sym] = bar['close']
+            else:
+                current_prices = {}
+
         holdings = {
             'time': market_event.datetime,
             'cash': self.current_cash,
             'total': self.current_cash,
             'unrealized_pnl': 0
         }
-        
+
         for symbol, position in self.current_holdings.items():
-            if position['quantity'] != 0:
-                latest_bar = self.data_handler.get_latest_bar(symbol)
-                
-                if latest_bar:
+            if position['quantity'] == 0:
+                continue
 
-                    market_rule = self.instrument_registry.get(symbol=symbol).market_rule
-                    current_price = latest_bar['close']
-                    quantity = position['quantity']
-                    avg_cost = position['avg_cost']
+            current_price = current_prices.get(symbol)
+            if current_price is None:
+                continue
 
-                    contract_multiplier = self.instrument_registry.get(symbol=symbol).contract_multiplier
+            market_rule = self.instrument_registry.get(symbol=symbol).market_rule
+            quantity = position['quantity']
+            avg_cost = position['avg_cost']
+            contract_multiplier = self.instrument_registry.get(symbol=symbol).contract_multiplier
 
-                    # mark to market
-                    if market_rule.requires_daily_settlement:
-                        prev_price = position.get('last_settle_price', avg_cost)
-                        mtm_pnl = (current_price - prev_price) * quantity * contract_multiplier
-                        self.current_cash += mtm_pnl
-                        holdings['cash'] += mtm_pnl
-                        holdings['total'] += mtm_pnl
-                        position['last_settle_price'] = current_price
+            if market_rule.requires_daily_settlement:
+                prev_price = position.get('last_settle_price', avg_cost)
+                mtm_pnl = (current_price - prev_price) * quantity * contract_multiplier
+                self.current_cash += mtm_pnl
+                holdings['cash'] += mtm_pnl
+                holdings['total'] += mtm_pnl
+                position['last_settle_price'] = current_price
+                unrealized_pnl = mtm_pnl
+            else:
+                prev_price = avg_cost
 
-                    market_value = quantity * current_price * contract_multiplier
-                    if market_rule.requires_daily_settlement:
-                        unrealized_pnl = (current_price - position['last_settle_price']) * quantity * contract_multiplier
-                    else:
-                        unrealized_pnl = (current_price - avg_cost) * quantity * contract_multiplier
+            if not market_rule.requires_daily_settlement:
+                market_value = quantity * current_price * contract_multiplier
+                unrealized_pnl = (current_price - avg_cost) * quantity * contract_multiplier
+                holdings[symbol + '_value'] = market_value
+                holdings[symbol + '_pnl'] = unrealized_pnl
+                holdings['total'] += market_value
+            else:
+                holdings[symbol + '_value'] = 0.0
+                holdings[symbol + '_pnl'] = unrealized_pnl
 
-                    holdings[symbol + '_value'] = market_value
-                    holdings[symbol + '_pnl'] = unrealized_pnl
-                    holdings['total'] += market_value
-        
+            holdings['unrealized_pnl'] += unrealized_pnl
+
         self.all_holdings.append(holdings)
 
 
@@ -203,17 +308,54 @@ class Portfolio():
     def _add_current_holding(self, symbol: str, price: float, quantity: float, commission: float) -> None:
         current_quantity = self.current_holdings[symbol]['quantity']
         current_avg_cost = self.current_holdings[symbol]['avg_cost']
-        
-        # Calculate commission per share
-        commission_per_share = commission / abs(quantity) if quantity != 0 else 0
 
-        if quantity > 0:
-            self.current_holdings[symbol]['quantity'] = current_quantity + quantity
-            self.current_holdings[symbol]['avg_cost'] = (current_avg_cost * current_quantity + (price + commission_per_share) * quantity) / (current_quantity + quantity)
+        # avg_cost records only the pure fill price; commission is accounted for
+        # separately in cash so it is never double-counted.
+        abs_qty = abs(quantity)
+        if abs_qty == 0:
+            return
 
-        elif quantity < 0:
-            self.current_holdings[symbol]['quantity'] = current_quantity + quantity
-            self.current_holdings[symbol]['avg_cost'] = (current_avg_cost * current_quantity + (price - commission_per_share) * quantity) / (current_quantity + quantity)
+        new_quantity = current_quantity + quantity
+        self.current_holdings[symbol]['quantity'] = new_quantity
+        # Weighted average of old cost basis and new fill price (always positive)
+        self.current_holdings[symbol]['avg_cost'] = (
+            current_avg_cost * abs(current_quantity) + price * abs_qty
+        ) / abs(new_quantity)
+
+    def _close_long_cash(self, symbol: str, market_rule, close_qty: float,
+                          position_qty: float, fill_price: float,
+                          contract_multiplier: int, pnl: float, commission: float) -> None:
+        """Update cash when closing (part of) a long position.
+
+        position_qty: the absolute held quantity *before* this close, used to
+                      compute the proportional share of margin to release.
+        """
+        if market_rule.requires_daily_settlement:
+            release_ratio = close_qty / position_qty if position_qty != 0 else 1.0
+            released = self.margin_used.get(symbol, 0) * release_ratio
+            self.margin_used[symbol] = self.margin_used.get(symbol, 0) - released
+            self.current_cash += released + pnl - commission
+        else:
+            self.current_cash += close_qty * fill_price * contract_multiplier - commission
+            self.margin_used.pop(symbol, None)
+
+    def _close_short_cash(self, symbol: str, market_rule, close_qty: float,
+                           position_qty: float, fill_price: float,
+                           contract_multiplier: int, pnl: float, commission: float) -> None:
+        """Update cash when closing (part of) a short position.
+
+        position_qty: the absolute held quantity *before* this close, used to
+                      compute the proportional share of margin to release.
+        """
+        if market_rule.requires_daily_settlement:
+            release_ratio = close_qty / position_qty if position_qty != 0 else 1.0
+            released = self.margin_used.get(symbol, 0) * release_ratio
+            self.margin_used[symbol] = self.margin_used.get(symbol, 0) - released
+            self.current_cash += released + pnl - commission
+        else:
+            # Short stock: pay back shares at current price
+            self.current_cash -= close_qty * fill_price * contract_multiplier + commission
+            self.margin_used.pop(symbol, None)
 
     def _reduce_current_holding(self, symbol: str, price: float, quantity: float, commission: float) -> None:
         current_quantity = self.current_holdings[symbol]['quantity']
@@ -223,72 +365,98 @@ class Portfolio():
         elif current_quantity < 0:
             self.current_holdings[symbol]['quantity'] = current_quantity + quantity
 
-    def _calculate_pnl(self, symbol: str, price: float, quantity: float, commission: float) -> float:
-        current_avg_cost = self.current_holdings[symbol]['avg_cost']
-
+    def _calculate_pnl(self, symbol: str, price: float, quantity: float, direction: str, commission: float) -> float:
         contract_multiplier = self.instrument_registry.get(symbol).contract_multiplier
-        
-        # Commission is already calculated in fill_event, so we just need price difference
-        commission_per_share = commission / abs(quantity) if quantity != 0 else 0
+        market_rule = self.instrument_registry.get(symbol=symbol).market_rule
 
-        if quantity < 0:
-            pnl = abs(quantity) * ((price - commission_per_share) - current_avg_cost) * contract_multiplier
+        if market_rule.requires_daily_settlement:
+            # For daily-settlement futures the MTM process has already credited
+            # every day's gain/loss into cash up to last_settle_price.  The
+            # realized PnL on a close is therefore only the move from the last
+            # settlement price to the fill price — NOT from the original entry
+            # price.  Using avg_cost here would double-count all settled gains.
+            cost_basis = self.current_holdings[symbol].get('last_settle_price',
+                         self.current_holdings[symbol]['avg_cost'])
+        else:
+            # For non-settlement instruments, cost basis is the average entry price.
+            cost_basis = self.current_holdings[symbol]['avg_cost']
 
-        elif quantity > 0:
-            pnl = quantity * (current_avg_cost - (price + commission_per_share)) * contract_multiplier
+        # commission is deducted from cash directly in process_fill_event;
+        # do NOT subtract it here (that would be a double-count).
+        if direction == 'SELL':
+            # Closing a long: profit = (fill_price - cost_basis) * qty
+            pnl = abs(quantity) * (price - cost_basis) * contract_multiplier
+        else:
+            # Closing a short: profit = (cost_basis - fill_price) * qty
+            pnl = abs(quantity) * (cost_basis - price) * contract_multiplier
 
         return pnl
     
-    def _process_settlements(self, current_time: str) -> None:
+    @staticmethod
+    def _parse_datetime(dt) -> Optional[datetime]:
+        """Normalise a datetime value that may be a str, datetime, or None."""
+        if isinstance(dt, datetime):
+            return dt.replace(tzinfo=None)   # strip tz for comparison
+        if isinstance(dt, str):
+            # Strip optional trailing timezone token (e.g. 'UTC+08:00')
+            cleaned = dt.rsplit(' ', 1)[0] if ' ' in dt else dt
+            for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+                try:
+                    return datetime.strptime(cleaned, fmt)
+                except ValueError:
+                    continue
+        return None
+
+    @staticmethod
+    def _add_trading_days(dt: datetime, n: int) -> datetime:
         """
-        Process pending settlements for T+1, T+2 markets
-        Release shares that have reached their settlement date
+        Advance *dt* by *n* trading days (Mon-Fri), skipping weekends.
+        A full exchange holiday calendar is not modelled here, but skipping
+        weekends already fixes the primary settlement-date error (e.g. US T+2:
+        Thursday buy settles Monday, not Saturday).
+        """
+        count = 0
+        result = dt
+        while count < n:
+            result += timedelta(days=1)
+            if result.weekday() < 5:   # 0=Mon … 4=Fri
+                count += 1
+        return result
+
+    def _process_settlements(self, current_time) -> None:
+        """
+        Process pending settlements for T+1, T+2 markets.
+        Release shares that have reached their settlement date.
+        Settlement days are counted in *trading* days, not calendar days.
         """
         if not self.pending_settlements:
             return
-        
-        # Parse current time
-        try:
-            if isinstance(current_time, str):
-                # Remove timezone suffix for parsing
-                time_str = current_time.rsplit(' ', 1)[0]
-                current_dt = datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
-            else:
-                current_dt = current_time
-        except:
+
+        current_dt = self._parse_datetime(current_time)
+        if current_dt is None:
             return
-        
-        # Check which settlements have matured
+
         settled = []
         for i, settlement in enumerate(self.pending_settlements):
-            buy_time = settlement['buy_time']
-            settlement_days = settlement['settlement_days']
-            
-            try:
-                if isinstance(buy_time, str):
-                    time_str = buy_time.rsplit(' ', 1)[0]
-                    buy_dt = datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
-                else:
-                    buy_dt = buy_time
-                
-                # Calculate settlement date (T+N trading days)
-                # Simplified: use calendar days for now
-                settlement_date = buy_dt + timedelta(days=settlement_days)
-                
-                if current_dt >= settlement_date:
-                    # Settlement has matured, make shares available
-                    symbol = settlement['symbol']
-                    quantity = settlement['quantity']
-                    
-                    if symbol in self.current_holdings:
-                        self.current_holdings[symbol]['available'] = \
-                            self.current_holdings[symbol].get('available', 0) + quantity
-                    
-                    settled.append(i)
-            except:
+            buy_dt = self._parse_datetime(settlement['buy_time'])
+            if buy_dt is None:
+                settled.append(i)   # discard malformed record
                 continue
-        
-        # Remove settled items (in reverse order to maintain indices)
+
+            # Strip intraday time so settlement_date is always at midnight of
+            # the settlement day; daily bar timestamps are also midnight, making
+            # the >= comparison correct regardless of what time the buy occurred.
+            buy_date = buy_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            settlement_date = self._add_trading_days(buy_date, settlement['settlement_days'])
+            if current_dt >= settlement_date:
+                symbol = settlement['symbol']
+                quantity = settlement['quantity']
+                if symbol in self.current_holdings:
+                    self.current_holdings[symbol]['available'] = (
+                        self.current_holdings[symbol].get('available', 0) + quantity
+                    )
+                settled.append(i)
+
         for i in reversed(settled):
             self.pending_settlements.pop(i)
 
