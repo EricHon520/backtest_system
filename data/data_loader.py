@@ -280,7 +280,10 @@ class DataLoader:
     def _load_fetched_ranges(self) -> dict:
         if os.path.exists(self._ranges_path):
             with open(self._ranges_path, 'r') as f:
-                return json.load(f)
+                try:
+                    return json.load(f)
+                except json.JSONDecodeError:
+                    return {}
         return {}
 
     def _save_fetched_ranges(self) -> None:

@@ -306,16 +306,10 @@ class TestMACrossoverThroughput:
     signals based on price data — tests the full signal aggregation path.
     """
 
-    @pytest.mark.parametrize('n_symbols,n_bars', [(3, 1_000), (5, 1_000), (5, 2_000)])
-    def test_ma_strategy_1yr_1min_bars_throughput(self, n_symbols, n_bars):
+    def test_ma_strategy_1yr_1min_bars_throughput(self):
         n_bars = 98_280
         bars = _generate_bars('BENCH', n_bars, seed=7)
-        symbols = [f'SYM{i:02d}' for i in range(n_symbols)]
-        bars_by_symbol = {
-            sym: _generate_bars(sym, n_bars, seed=i * 17)
-            for i, sym in enumerate(symbols)
-        }
-        feed = MockDataFeed(bars_by_symbol)
+        feed = MockDataFeed({'BENCH': bars})
         rule = _zero_fee_rule()
         registry = InstrumentRegistry()
         registry.register(Stock(symbol='BENCH', market_rule=rule, currency='USD'))
@@ -340,6 +334,51 @@ class TestMACrossoverThroughput:
               f"({elapsed*1000:.1f} ms)  trades={len(portfolio.positions)}")
         assert bps >= _MIN_BPS_TRADING, (
             f"MA strategy throughput {bps:.0f} bars/sec below {_MIN_BPS_TRADING}")
+
+    def test_ma_strategy_multi_symbol_1yr_throughput(self):
+        """
+        Compare MA(5,20) strategy throughput: single symbol vs 5 symbols.
+        Tests how signal aggregation scales with more symbols.
+        """
+        n_bars = 98_280  # 1 year of 1-minute data per symbol
+        n_symbols = 5
+
+        symbols = [f'SYM{i:02d}' for i in range(n_symbols)]
+        bars_by_symbol = {
+            sym: _generate_bars(sym, n_bars, seed=i * 17)
+            for i, sym in enumerate(symbols)
+        }
+
+        feed = MockDataFeed(bars_by_symbol)
+        rule = _zero_fee_rule()
+        registry = InstrumentRegistry()
+        for sym in symbols:
+            registry.register(Stock(symbol=sym, market_rule=rule, currency='USD'))
+
+        strategies = [
+            MovingAverage(data_handler=feed, short_window=5, long_window=20)
+            for _ in symbols
+        ]
+        portfolio = Portfolio(initial_capital=5_000_000.0, instrument_registry=registry)
+        execution = SimulatedExecutionModel(
+            data_handler=feed, instrument_registry=registry, fill_on_next_bar=True)
+        engine = Engine(
+            data_handler=feed, portfolio=portfolio,
+            execution_handler=execution, instrument_registry=registry,
+            strategies=strategies,
+            position_sizer=FixedQuantityPositionSizer(quantity=100),
+        )
+
+        t0 = time.perf_counter()
+        engine.run()
+        elapsed = time.perf_counter() - t0
+
+        total_bar_symbols = n_bars * n_symbols
+        bps = _throughput(elapsed, total_bar_symbols)
+        print(f"\n[MA(5,20) {n_symbols} symbols × {n_bars:,} bars] {bps:,.0f} bar-symbols/sec  "
+              f"({elapsed*1000:.1f} ms)  trades={len(portfolio.positions)}")
+        assert bps >= _MIN_BPS_TRADING, (
+            f"Multi-symbol MA strategy throughput {bps:.0f} bar-symbols/sec below {_MIN_BPS_TRADING}")
 
     def test_ma_strategy_generates_trades(self):
         """MA strategy must produce at least some signals on a random-walk series."""

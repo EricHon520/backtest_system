@@ -2,6 +2,7 @@ from datetime import datetime, time
 from typing import Optional, Dict, Any, List
 import pytz
 import math
+from core.cpp_wrapper import normalize_price, calculate_commission, calculate_slippage
 
 
 class MarketRule:
@@ -253,24 +254,11 @@ class MarketRule:
         """
         Calculate total commission and fees for a trade
         """
-        trade_value = quantity * price * contract_multiplier
-        
-        # Commission
-        commission = max(trade_value * self.commission_rate, self.min_commission)
-        
-        # Stamp duty
-        if self.stamp_duty_on_sell_only:
-            stamp_duty = trade_value * self.stamp_duty if direction == 'SELL' else 0.0
-        else:
-            stamp_duty = trade_value * self.stamp_duty
-        
-        # Transfer fee
-        transfer_fee = trade_value * self.transfer_fee
-
-        # Trading fee
-        trading_fee = trade_value * self.trading_fee
-        
-        return commission + stamp_duty + transfer_fee + trading_fee
+        return calculate_commission(
+            symbol, quantity, price, direction, contract_multiplier,
+            self.commission_rate, self.min_commission, self.stamp_duty_on_sell_only,
+            self.stamp_duty, self.transfer_fee, self.trading_fee
+        )
     
     def normalize_quantity(self, quantity: int) -> int:
         """
@@ -282,18 +270,18 @@ class MarketRule:
         """
         Normalize price to comply with tick size requirements
         """
-        return round(price / self.price_tick) * self.price_tick
+        return normalize_price(price, self.price_tick)
     
-    def calculate_slippage(self, symbol: str, quantity: int, price: float, direction: str, 
+    def calculate_slippage(self, symbol: str, quantity: int, price: float, direction: str,
                           bar_volume: float, bar_high: float, bar_low: float) -> float:
         """
         Calculate slippage based on order size relative to bar volume
-        
+
         Volume-based slippage model:
         - Estimates market impact based on order size as % of bar volume
         - Larger orders relative to volume → more slippage
         - Uses high-low spread as volatility proxy
-        
+
         Args:
             symbol: Trading symbol
             quantity: Order quantity
@@ -302,55 +290,14 @@ class MarketRule:
             bar_volume: Volume of the current bar
             bar_high: High price of the current bar
             bar_low: Low price of the current bar
-        
+
         Returns:
             Adjusted price after slippage
         """
-        if self.slippage_model == "none" or self.slippage_model is None:
-            return price
-        
-        if self.slippage_model == "fixed":
-            # Fixed slippage in basis points
-            slippage_pct = self.fixed_slippage_bps / 10000.0
-            if direction == 'BUY':
-                return price * (1 + slippage_pct)
-            else:
-                return price * (1 - slippage_pct)
-        
-        elif self.slippage_model == "volume_based":
-            if bar_volume <= 0:
-                slippage_pct = 0.001  # 0.1% default
-            else:
-                order_volume_pct = quantity / bar_volume if bar_volume > 0 else 0
-
-                spread_pct = (bar_high - bar_low) / price if price > 0 else 0
-                
-                # Slippage = volume_factor * sqrt(order_volume_pct) * spread_pct
-                # Square root to model non-linear market impact
-                slippage_pct = self.volume_slippage_factor * math.sqrt(order_volume_pct) * spread_pct
-                
-                # Cap maximum slippage at 1% to avoid unrealistic values
-                slippage_pct = min(slippage_pct, 0.01)
-            
-            if direction == 'BUY':
-                return price * (1 + slippage_pct)
-            else:
-                return price * (1 - slippage_pct)
-        
-        elif self.slippage_model == "spread_based":
-            # Spread-based slippage (cross the spread)
-            spread = bar_high - bar_low
-            spread_pct = spread / price if price > 0 else 0
-            
-            # Assume we pay half the spread
-            slippage_pct = spread_pct * 0.5
-            
-            if direction == 'BUY':
-                return price * (1 + slippage_pct)
-            else:
-                return price * (1 - slippage_pct)
-        
-        return price
+        return calculate_slippage(
+            symbol, quantity, price, direction, bar_volume, bar_high, bar_low,
+            self.slippage_model, self.fixed_slippage_bps, self.volume_slippage_factor
+        )
 
     def calculate_margin(self, symbol: str, quantity: int, price: float, contract_multiplier: int):
         return quantity * price * contract_multiplier

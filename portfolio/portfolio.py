@@ -1,6 +1,8 @@
+from textwrap import fill
 import warnings
 from datetime import datetime, timedelta
 from typing import Dict, Optional
+from core import market_rule
 from core.event import SignalEvent, OrderEvent, FillEvent, MarketEvent
 from core.instrument import InstrumentRegistry
 
@@ -85,150 +87,33 @@ class Portfolio():
         )
 
     def process_fill_event(self, fill_event: FillEvent) -> None:
-        if not fill_event.rejected:
-            fill_price = fill_event.fill_price
-            symbol = fill_event.symbol
-            quantity = fill_event.quantity
-            commission = fill_event.commission
-            direction = fill_event.direction
-            time = fill_event.datetime
+        if fill_event.rejected:
+            return
+        symbol = fill_event.symbol
+        fill_price = fill_event.fill_price
+        quantity = fill_event.quantity
+        commission = fill_event.commission
+        direction = fill_event.direction
+        time = fill_event.datetime
 
-            market_rule = self.instrument_registry.get(symbol=symbol).market_rule
+        market_rule = self.instrument_registry.get(symbol=symbol).market_rule
+        contract_multiplier = self.instrument_registry.get(symbol=symbol).contract_multiplier
 
-            if symbol not in self.current_holdings:
-                self.current_holdings[symbol] = {'quantity': 0, 'avg_cost': 0, 'available': 0}
+        if symbol not in self.current_holdings:
+            self.current_holdings[symbol] = {'quantity': 0, 'avg_cost': 0, 'available': 0}
 
-            current_quantity = self.current_holdings[symbol]['quantity']
-            current_avg_cost = self.current_holdings[symbol]['avg_cost']
+        current_quantity = self.current_holdings[symbol]['quantity']
+        quantity_change = quantity if direction == 'BUY' else -quantity
+        new_quantity = current_quantity + quantity_change
 
-            quantity_change = quantity if direction == 'BUY' else -quantity
-            new_quantity = current_quantity + quantity_change
+        pnl = self._update_position(symbol=symbol, fill_price=fill_price, quantity=quantity, direction=direction, commission=commission, current_quantity=current_quantity)
+        self._update_cash(symbol=symbol, direction=direction, fill_price=fill_price, quantity=quantity, commission=commission, pnl=pnl, market_rule=market_rule, 
+                          contract_multiplier=contract_multiplier, current_quantity=current_quantity, new_quantity=new_quantity)
+        self._update_settlement(symbol=symbol, direction=direction, quantity=quantity, time=time, market_rule=market_rule)
+        self._record_trade(symbol=symbol, fill_price=fill_price, quantity=quantity, commission=commission, direction=direction, time=time, pnl=pnl)
 
-            pnl = 0
+        self.total_realized_pnl += pnl
 
-            # 開倉
-            if current_quantity == 0:
-                self._add_current_holding(symbol=symbol, price=fill_price, quantity=new_quantity, commission=commission)
-
-            # 加倉
-            elif current_quantity * quantity_change > 0:
-                self._add_current_holding(symbol=symbol, price=fill_price, quantity=quantity_change, commission=commission)
-            
-            # 減倉        
-            elif current_quantity * quantity_change < 0 and abs(current_quantity) > abs(quantity_change):
-                self._reduce_current_holding(symbol=symbol, price=fill_price, quantity=quantity, commission=commission)
-                pnl = self._calculate_pnl(symbol=symbol, price=fill_price, quantity=quantity, direction=direction, commission=commission)
-
-            # 平倉或轉向
-            elif current_quantity * quantity_change < 0 and abs(current_quantity) <= abs(quantity_change):
-                close_qty = abs(current_quantity)
-                self._reduce_current_holding(symbol=symbol, price=fill_price, quantity=close_qty, commission=commission)
-                pnl = self._calculate_pnl(symbol=symbol, price=fill_price, quantity=close_qty, direction=direction, commission=commission)
-                if new_quantity != 0:
-                    self._add_current_holding(symbol=symbol, price=fill_price, quantity=new_quantity, commission=commission)
-
-            contract_multiplier = self.instrument_registry.get(symbol).contract_multiplier
-
-            margin = market_rule.calculate_margin(symbol=symbol, quantity=quantity, price=fill_price, contract_multiplier=contract_multiplier)
-
-            # ----------------------------------------------------------------
-            # Cash-flow accounting
-            # Rules:
-            #   BUY  (open long / close short)  : deduct margin + commission
-            #   SELL (open short / close long)   : depends on instrument type
-            #
-            # For a reversal (close old + open new in same fill), we handle the
-            # closing leg first, then deduct/add for the new leg separately.
-            # ----------------------------------------------------------------
-            is_reversal = (current_quantity * quantity_change < 0
-                           and abs(current_quantity) < abs(quantity_change))
-            new_leg_qty = abs(new_quantity) if is_reversal else 0
-            close_leg_qty = abs(current_quantity) if is_reversal else quantity
-
-            if direction == 'BUY':
-                if is_reversal:
-                    # Closing leg: short was open — return short margin + pnl.
-                    # position_qty = abs(current_quantity) so exactly 100% of
-                    # the short margin is released.
-                    self._close_short_cash(symbol, market_rule, close_leg_qty,
-                                           abs(current_quantity), fill_price,
-                                           contract_multiplier, pnl, commission)
-                    # New leg: open long — deduct margin
-                    new_margin = market_rule.calculate_margin(
-                        symbol=symbol, quantity=new_leg_qty,
-                        price=fill_price, contract_multiplier=contract_multiplier)
-                    self.current_cash -= new_margin  # commission already paid once
-                    self.margin_used[symbol] = self.margin_used.get(symbol, 0) + new_margin
-                else:
-                    self.current_cash -= (margin + commission)
-                    self.margin_used[symbol] = self.margin_used.get(symbol, 0) + margin
-                self.current_holdings[symbol]['last_settle_price'] = fill_price
-
-            elif direction == 'SELL':
-                if is_reversal:
-                    # Closing leg: long was open — return proceeds / margin.
-                    # position_qty = abs(current_quantity) so exactly 100% of
-                    # the long margin is released.
-                    self._close_long_cash(symbol, market_rule, close_leg_qty,
-                                          abs(current_quantity), fill_price,
-                                          contract_multiplier, pnl, commission)
-                    # New leg: open short — deduct margin
-                    new_margin = market_rule.calculate_margin(
-                        symbol=symbol, quantity=new_leg_qty,
-                        price=fill_price, contract_multiplier=contract_multiplier)
-                    self.current_cash -= new_margin  # commission already paid once
-                    self.margin_used[symbol] = self.margin_used.get(symbol, 0) + new_margin
-                    self.current_holdings[symbol]['last_settle_price'] = fill_price
-                elif market_rule.requires_daily_settlement:
-                    if current_quantity > 0:
-                        # Partial or full close of a long futures position.
-                        # position_qty = current_quantity so only the proportional
-                        # share of margin is released (e.g. selling 1 of 3 lots
-                        # releases 1/3 of margin_used).
-                        self._close_long_cash(symbol, market_rule, quantity,
-                                              current_quantity, fill_price,
-                                              contract_multiplier, pnl, commission)
-                    else:
-                        # Opening a SHORT futures position
-                        self.current_cash -= (margin + commission)
-                        self.margin_used[symbol] = self.margin_used.get(symbol, 0) + margin
-                        self.current_holdings[symbol]['last_settle_price'] = fill_price
-                else:
-                    # Stocks: cash received = sale proceeds − commission
-                    self.current_cash += quantity * fill_price * contract_multiplier - commission
-                    self.margin_used.pop(symbol, None)
-            
-            # Handle T+1, T+2 settlement for availability
-            if market_rule.settlement_days > 0:
-                if direction == 'BUY':
-                    # Add to pending settlements, will be available after settlement_days
-                    self.pending_settlements.append({
-                        'symbol': symbol,
-                        'quantity': quantity,
-                        'buy_time': time,
-                        'settlement_days': market_rule.settlement_days
-                    })
-                elif direction == 'SELL':
-                    # Reduce available quantity when selling (floor at 0)
-                    self.current_holdings[symbol]['available'] = max(
-                        0, self.current_holdings[symbol].get('available', 0) - quantity
-                    )
-            else:
-                # T+0 market, immediately available
-                self.current_holdings[symbol]['available'] = self.current_holdings[symbol]['quantity']
-
-            self.total_realized_pnl += pnl
-
-            position = {
-                'symbol': symbol,
-                'fill_price': fill_price,
-                'quantity': quantity,
-                'commission': commission,
-                'direction': direction,
-                'time': time,
-                'realized_pnl': pnl
-            }
-            self.positions.append(position)
 
     def update_timeindex(self, market_event: MarketEvent,
                          current_prices: Optional[Dict[str, float]] = None):
@@ -460,4 +345,120 @@ class Portfolio():
         for i in reversed(settled):
             self.pending_settlements.pop(i)
 
+    def _update_position(self, symbol: str, fill_price: float,
+                         quantity: int, direction: str,
+                         commission: float, current_quantity: int) -> float:
+        """
+        Update holdings for open/add/reduce/close/reverse
+        Returns realized PnL
+        """
+        quantity_change = quantity if direction == "BUY" else -quantity
+        new_quantity = current_quantity + quantity_change
+        pnl = 0
 
+        # open position
+        if current_quantity == 0:
+            self._add_current_holding(symbol=symbol, price=fill_price, quantity=new_quantity, commission=commission)
+
+        # add position
+        elif current_quantity * quantity_change > 0:
+            self._add_current_holding(symbol=symbol, price=fill_price, quantity=quantity_change, commission=commission)
+
+        # reduce position
+        elif current_quantity * quantity_change < 0 and abs(current_quantity) > abs(quantity_change):
+            self._reduce_current_holding(symbol=symbol, price=fill_price, quantity=quantity, commission=commission)
+            pnl = self._calculate_pnl(symbol=symbol, price=fill_price, quantity=quantity, direction=direction, commission=commission)
+
+        # close or reverse position
+        elif current_quantity * quantity_change < 0 and abs(current_quantity) <= abs(quantity_change):
+            close_qty = abs(current_quantity)
+            self._reduce_current_holding(symbol=symbol, price=fill_price, quantity=close_qty, commission=commission)
+            pnl = self._calculate_pnl(symbol=symbol, price=fill_price, quantity=close_qty, direction=direction, commission=commission)
+            if new_quantity != 0:
+                self._add_current_holding(symbol=symbol, price=fill_price, quantity=new_quantity, commission=commission)
+
+        return pnl
+
+    def _update_cash(self, symbol: str, direction: str, fill_price: float,
+                     quantity: int, commission: float, pnl: float,
+                     market_rule, contract_multiplier: int,
+                     current_quantity: int, new_quantity: int) -> None:
+        """
+        Handle cash-flow accounting for a fill
+        """
+        margin = market_rule.calculate_margin(symbol=symbol, quantity=quantity, price=fill_price, contract_multiplier=contract_multiplier)
+
+        is_reversal = (current_quantity * (quantity if direction == "BUY" else -quantity) < 0
+                       and abs(current_quantity) < abs(quantity))
+        
+        close_leg_qty = abs(current_quantity) if is_reversal else quantity
+
+        new_leg_qty = abs(new_quantity) if is_reversal else 0
+
+        if direction == "BUY":
+            if is_reversal:
+                self._close_short_cash(symbol=symbol, market_rule=market_rule, close_qty=close_leg_qty,
+                                       position_qty=abs(current_quantity), fill_price=fill_price,
+                                       contract_multiplier=contract_multiplier, pnl=pnl, commission=commission)
+                new_margin = market_rule.calculate_margin(symbol=symbol, quantity=new_leg_qty, price=fill_price, contract_multiplier=contract_multiplier)
+                self.current_cash -= new_margin
+                self.margin_used[symbol] = self.margin_used.get(symbol, 0) + new_margin
+            else:
+                self.current_cash -= (margin + commission)
+                self.margin_used[symbol] = self.margin_used.get(symbol, 0) + margin
+            self.current_holdings[symbol]['last_settle_price'] = fill_price
+
+        elif direction == 'SELL':
+            if is_reversal:
+                self._close_long_cash(symbol=symbol, market_rule=market_rule, close_qty=close_leg_qty,
+                                      position_qty=abs(current_quantity), fill_price=fill_price,
+                                      contract_multiplier=contract_multiplier, pnl=pnl, commission=commission)
+                new_margin = market_rule.calculate_margin(symbol=symbol, quantity=new_leg_qty, price=fill_price, contract_multiplier=contract_multiplier)
+                self.current_cash -= new_margin
+                self.margin_used[symbol] = self.margin_used.get(symbol, 0) + new_margin
+                self.current_holdings[symbol]['last_settle_price'] = fill_price
+            elif market_rule.requires_daily_settlement:
+                if current_quantity > 0:
+                    self._close_long_cash(symbol=symbol, market_rule=market_rule, close_qty=quantity,
+                                          position_qty=current_quantity, fill_price=fill_price,
+                                          contract_multiplier=contract_multiplier, pnl=pnl, commission=commission)
+                else:
+                    self.current_cash -= (margin + commission)
+                    self.margin_used[symbol] = self.margin_used.get(symbol, 0) + margin
+                    self.current_holdings[symbol]['last_settle_price'] = fill_price
+            else:
+                self.current_cash += quantity * fill_price * contract_multiplier - commission
+                self.margin_used.pop(symbol, None)
+    
+    def _update_settlement(self, symbol: str, direction: str, 
+                           quantity: int, time, market_rule) -> None:
+        """
+        Handle T+1/T+2 availability tracking
+        """
+        if market_rule.settlement_days > 0:
+            if direction == "BUY":
+                self.pending_settlements.append({
+                    'symbol': symbol,
+                    'quantity': quantity,
+                    'buy_time': time,
+                    'settlement_days': market_rule.settlement_days
+                })
+            elif direction == 'SELL':
+                self.current_holdings[symbol]['available'] = max(0, self.current_holdings[symbol].get('available', 0) - quantity)
+        else:
+            self.current_holdings[symbol]['available'] = self.current_holdings[symbol]['quantity']
+
+    def _record_trade(self, symbol: str, fill_price: float, quantity: int,
+                      commission: float, direction: str, time, pnl: float) -> None:
+        """
+        Append trade record to positions log
+        """
+        self.positions.append({
+            'symbol': symbol,
+            'fill_price': fill_price,
+            'quantity': quantity,
+            'commission': commission,
+            'direction': direction,
+            'time': time,
+            'realized_pnl': pnl
+        })

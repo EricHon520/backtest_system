@@ -1,6 +1,6 @@
 import calendar
 import logging
-from queue import Queue
+from collections import deque
 from core.event import Event, EventType, MarketEvent, OrderEvent, SignalEvent
 from core.data_feed import DataFeed
 from core.strategy import Strategy
@@ -61,7 +61,7 @@ class Engine:
         self.position_sizer = position_sizer or PercentOfEquityPositionSizer(percent=0.10)
         self.risk_manager = risk_manager or NullRiskManager()
 
-        self.queue = Queue()
+        self.queue = deque()
         self.timezone = getattr(self.data_handler, '_timezone', 'UTC')
         self.expired_symbols = set()
         self.logger = logging.getLogger(__name__)
@@ -72,35 +72,50 @@ class Engine:
     # ------------------------------------------------------------------
 
     def run(self):
-        while self.data_handler.update_bars():
-            updated_symbols = []
-            current_datetime = None
-            current_prices: Dict[str, float] = {}
-
-            for symbol in self.data_handler.symbols:
-                bar = self.data_handler.get_latest_bar(symbol=symbol)
-                if bar is not None:
-                    updated_symbols.append(bar['ticker'])
-                    current_datetime = bar['datetime_local']
-                    if 'close' in bar:
-                        current_prices[bar['ticker']] = bar['close']
-
-            if current_datetime is None:
-                continue
-
-            market_event = MarketEvent(datetime=current_datetime, symbols=updated_symbols)
-            market_event.current_prices = current_prices  # carry prices alongside event
-            self.queue.put(market_event)
-
-            while not self.queue.empty():
-                event = self.queue.get()
-                try:
-                    self._process_event(event=event)
-                except Exception as exc:
-                    self.logger.error(
-                        "Unhandled exception processing %s event: %s",
-                        event.event_type, exc, exc_info=True
-                    )
+        while self.run_one_bar():
+            pass
+    
+    def run_one_bar(self) -> bool:
+        """
+        Process a single bar.
+    
+        Returns True if a bar was emitted and processed, False when the
+        data feed is exhausted.  Suitable for live trading loops where the
+        caller controls the timing.
+        """
+        if not self.data_handler.update_bars():
+            return False
+ 
+        updated_symbols = []
+        current_datetime = None
+        current_prices: Dict[str, float] = {}
+    
+        for symbol in self.data_handler.symbols:
+            bar = self.data_handler.get_latest_bar(symbol=symbol)
+            if bar is not None:
+                updated_symbols.append(bar['ticker'])
+                current_datetime = bar['datetime_local']
+                if 'close' in bar:
+                    current_prices[bar['ticker']] = bar['close']
+    
+        if current_datetime is None:
+            return True  # bar consumed but empty, continue
+    
+        market_event = MarketEvent(datetime=current_datetime, symbols=updated_symbols)
+        market_event.current_prices = current_prices
+        self.queue.append(market_event)
+    
+        while self.queue:
+            event = self.queue.popleft()
+            try:
+                self._process_event(event=event)
+            except Exception as exc:
+                self.logger.error(
+                    "Unhandled exception processing %s event: %s",
+                    event.event_type, exc, exc_info=True
+                )
+    
+        return True
 
     # ------------------------------------------------------------------
     # Internal
@@ -115,7 +130,7 @@ class Engine:
                 #    processed before the MTM snapshot for this bar.
                 fill_events = self.execution_handler.on_new_bar()
                 for fill_event in fill_events:
-                    self.queue.put(fill_event)
+                    self.queue.append(fill_event)
 
                 # 2. Auto-close expired instruments.  Their fills also need to
                 #    land before the MTM snapshot.
@@ -123,7 +138,7 @@ class Engine:
                 for order_event in order_events:
                     expiry_fill = self.execution_handler._execute_order(order_event)
                     if expiry_fill is not None:
-                        self.queue.put(expiry_fill)
+                        self.queue.append(expiry_fill)
 
                 # 3. Drain every FILL event that is already in the queue so
                 #    that update_timeindex sees the correct post-fill holdings.
@@ -157,7 +172,7 @@ class Engine:
                 # 5. Aggregate signals (resolve conflicts) then enqueue
                 aggregated = self.signal_aggregator.aggregate(raw_signals)
                 for sig in aggregated:
-                    self.queue.put(sig)
+                    self.queue.append(sig)
 
             case EventType.SIGNAL:
                 self._handle_signal(event)
@@ -218,7 +233,7 @@ class Engine:
         )
 
         if final_order is not None:
-            self.queue.put(final_order)
+            self.queue.append(final_order)
 
     def _drain_fills(self) -> None:
         """
@@ -232,8 +247,8 @@ class Engine:
         them relative to the MTM step.
         """
         deferred = []
-        while not self.queue.empty():
-            ev = self.queue.get()
+        while self.queue:
+            ev = self.queue.popleft()
             if ev.event_type == EventType.FILL:
                 try:
                     self.portfolio.process_fill_event(ev)
@@ -245,7 +260,7 @@ class Engine:
             else:
                 deferred.append(ev)
         for ev in deferred:
-            self.queue.put(ev)
+            self.queue.append(ev)
 
     @staticmethod
     def _coerce_datetime(dt) -> Optional[datetime]:
